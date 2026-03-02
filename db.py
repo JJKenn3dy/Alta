@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS user_profiles (
   user_id INTEGER NOT NULL,
   display_name TEXT,
   nickname TEXT,
+  approved_display_name TEXT,
   gender TEXT,
   interests TEXT NOT NULL DEFAULT '',
   communication_style TEXT NOT NULL DEFAULT '',
@@ -84,6 +85,22 @@ CREATE TABLE IF NOT EXISTS user_profiles (
   PRIMARY KEY (chat_id, user_id)
 );
 
+CREATE TABLE IF NOT EXISTS pending_name_approvals (
+  chat_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  requested_name TEXT NOT NULL,
+  request_message_id INTEGER,
+  approval_message_id INTEGER UNIQUE,
+  requested_by INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (chat_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_name_approvals_chat_status
+ON pending_name_approvals(chat_id, status, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS user_documents (
   chat_id INTEGER NOT NULL,
   user_id INTEGER NOT NULL,
@@ -91,6 +108,22 @@ CREATE TABLE IF NOT EXISTS user_documents (
   document_text TEXT NOT NULL DEFAULT '',
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (chat_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS user_facts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  fact_type TEXT NOT NULL,
+  value TEXT NOT NULL,
+  normalized_value TEXT NOT NULL,
+  confidence REAL NOT NULL DEFAULT 0.6,
+  importance REAL NOT NULL DEFAULT 0.5,
+  evidence TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_seen_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS memories (
@@ -107,6 +140,10 @@ CREATE TABLE IF NOT EXISTS memories (
 
 CREATE INDEX IF NOT EXISTS idx_memories_chat_user ON memories(chat_id, user_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_chat_user_key ON memories(chat_id, user_id, key);
+CREATE INDEX IF NOT EXISTS idx_user_facts_chat_user ON user_facts(chat_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_user_facts_lookup ON user_facts(chat_id, user_id, fact_type, normalized_value);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_facts_unique
+ON user_facts(chat_id, user_id, fact_type, normalized_value);
 
 CREATE TABLE IF NOT EXISTS debug_traces (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -186,6 +223,123 @@ class DB:
             "PRIMARY KEY (chat_id, user_id)"
             ")"
         )
+        cur = await self.conn.execute("PRAGMA table_info(user_facts)")
+        user_fact_columns = {row["name"] for row in await cur.fetchall()}
+        if "evidence" not in user_fact_columns:
+            await self.conn.execute(
+                "ALTER TABLE user_facts ADD COLUMN evidence TEXT NOT NULL DEFAULT ''"
+            )
+        if "source" not in user_fact_columns:
+            await self.conn.execute(
+                "ALTER TABLE user_facts ADD COLUMN source TEXT NOT NULL DEFAULT ''"
+            )
+        if "created_at" not in user_fact_columns:
+            await self.conn.execute(
+                "ALTER TABLE user_facts ADD COLUMN created_at TEXT NOT NULL DEFAULT ''"
+            )
+            await self.conn.execute(
+                "UPDATE user_facts SET created_at=datetime('now') WHERE created_at=''"
+            )
+        if "updated_at" not in user_fact_columns:
+            await self.conn.execute(
+                "ALTER TABLE user_facts ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"
+            )
+            await self.conn.execute(
+                "UPDATE user_facts SET updated_at=datetime('now') WHERE updated_at=''"
+            )
+        if "last_seen_at" not in user_fact_columns:
+            await self.conn.execute(
+                "ALTER TABLE user_facts ADD COLUMN last_seen_at TEXT NOT NULL DEFAULT ''"
+            )
+            await self.conn.execute(
+                "UPDATE user_facts SET last_seen_at=datetime('now') WHERE last_seen_at=''"
+            )
+
+        await self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_facts_chat_user "
+            "ON user_facts(chat_id, user_id)"
+        )
+        await self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_facts_lookup "
+            "ON user_facts(chat_id, user_id, fact_type, normalized_value)"
+        )
+        await self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_user_facts_unique "
+            "ON user_facts(chat_id, user_id, fact_type, normalized_value)"
+        )
+        cur = await self.conn.execute("PRAGMA table_info(user_profiles)")
+        user_profile_columns = {row["name"] for row in await cur.fetchall()}
+        if "approved_display_name" not in user_profile_columns:
+            await self.conn.execute(
+                "ALTER TABLE user_profiles ADD COLUMN approved_display_name TEXT"
+            )
+
+        await self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS pending_name_approvals ("
+            "chat_id INTEGER NOT NULL,"
+            "user_id INTEGER NOT NULL,"
+            "requested_name TEXT NOT NULL,"
+            "request_message_id INTEGER,"
+            "approval_message_id INTEGER UNIQUE,"
+            "requested_by INTEGER NOT NULL,"
+            "status TEXT NOT NULL DEFAULT 'pending',"
+            "created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+            "updated_at TEXT NOT NULL DEFAULT (datetime('now')),"
+            "PRIMARY KEY (chat_id, user_id)"
+            ")"
+        )
+        await self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pending_name_approvals_chat_status "
+            "ON pending_name_approvals(chat_id, status, updated_at DESC)"
+        )
+        await self._migrate_legacy_memories_to_user_facts()
+
+    async def _migrate_legacy_memories_to_user_facts(self):
+        assert self.conn
+        await self.conn.execute(
+            """
+            INSERT OR IGNORE INTO user_facts(
+              chat_id,user_id,fact_type,value,normalized_value,confidence,importance,evidence,source,created_at,updated_at,last_seen_at
+            )
+            SELECT
+              chat_id,
+              user_id,
+              CASE
+                WHEN key IN ('interests', 'hobby') THEN 'interest'
+                WHEN key IN ('job', 'work') THEN 'work'
+                WHEN key = 'study' THEN 'study'
+                WHEN key = 'location' THEN 'location'
+                WHEN key = 'goal' THEN 'goal'
+                WHEN key = 'relationship_notes' THEN 'relationship'
+                WHEN key = 'preference' THEN 'preference'
+                ELSE 'fact'
+              END,
+              value,
+              trim(lower(value)),
+              confidence,
+              importance,
+              key,
+              CASE
+                WHEN coalesce(source, '') = '' THEN 'legacy_memory'
+                ELSE 'legacy_memory:' || source
+              END,
+              updated_at,
+              updated_at,
+              updated_at
+            FROM memories
+            WHERE trim(value) <> ''
+              AND key NOT LIKE '\\_%' ESCAPE '\\'
+              AND key NOT IN (
+                'name',
+                'preferred_name',
+                'gender',
+                'pronouns',
+                'nickname',
+                'communication_style',
+                'response_preference'
+              )
+            """
+        )
 
     async def _cleanup_identity_noise(self):
         assert self.conn
@@ -221,20 +375,15 @@ class DB:
             INVALID_IDENTITY_VALUES,
         )
         await self.conn.execute(
+            f"UPDATE user_profiles SET approved_display_name=NULL "
+            f"WHERE lower(trim(approved_display_name)) IN ({identity_placeholders})",
+            INVALID_IDENTITY_VALUES,
+        )
+        await self.conn.execute(
             f"UPDATE user_profiles SET gender=NULL "
             f"WHERE lower(trim(gender)) IN ({gender_placeholders})",
             INVALID_GENDER_VALUES,
         )
-        await self.conn.execute(
-            "UPDATE user_profiles SET "
-            "gender=NULL,"
-            "interests='',"
-            "communication_style='',"
-            "response_preference='',"
-            "relationship_notes='' "
-            "WHERE profile_confidence < 0.75"
-        )
-
     async def close(self):
         if self.conn:
             await self.conn.close()
@@ -263,6 +412,15 @@ class DB:
             (user_id, username),
         )
         await self.conn.commit()
+
+    async def get_user(self, user_id: int) -> dict:
+        assert self.conn
+        cur = await self.conn.execute(
+            "SELECT user_id,username,first_seen,last_seen FROM users WHERE user_id=?",
+            (user_id,),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else {}
 
     async def add_message(
         self,
@@ -358,7 +516,7 @@ class DB:
     async def get_user_profile(self, chat_id: int, user_id: int) -> dict:
         assert self.conn
         cur = await self.conn.execute(
-            "SELECT display_name,nickname,gender,interests,communication_style,"
+            "SELECT display_name,nickname,approved_display_name,gender,interests,communication_style,"
             "response_preference,relationship_notes,profile_confidence,updated_at "
             "FROM user_profiles WHERE chat_id=? AND user_id=?",
             (chat_id, user_id),
@@ -402,6 +560,7 @@ class DB:
         *,
         display_name: str | None = None,
         nickname: str | None = None,
+        approved_display_name: str | None = None,
         gender: str | None = None,
         interests: str | None = None,
         communication_style: str | None = None,
@@ -413,12 +572,13 @@ class DB:
         current = await self.get_user_profile(chat_id, user_id)
         await self.conn.execute(
             "INSERT INTO user_profiles("
-            "chat_id,user_id,display_name,nickname,gender,interests,communication_style,"
+            "chat_id,user_id,display_name,nickname,approved_display_name,gender,interests,communication_style,"
             "response_preference,relationship_notes,profile_confidence"
-            ") VALUES(?,?,?,?,?,?,?,?,?,?) "
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(chat_id,user_id) DO UPDATE SET "
             "display_name=excluded.display_name,"
             "nickname=excluded.nickname,"
+            "approved_display_name=excluded.approved_display_name,"
             "gender=excluded.gender,"
             "interests=excluded.interests,"
             "communication_style=excluded.communication_style,"
@@ -431,6 +591,9 @@ class DB:
                 user_id,
                 display_name if display_name is not None else current.get("display_name"),
                 nickname if nickname is not None else current.get("nickname"),
+                approved_display_name
+                if approved_display_name is not None
+                else current.get("approved_display_name"),
                 gender if gender is not None else current.get("gender"),
                 interests if interests is not None else current.get("interests", ""),
                 communication_style
@@ -449,6 +612,93 @@ class DB:
         )
         await self.conn.commit()
 
+    async def create_pending_name_approval(
+        self,
+        chat_id: int,
+        user_id: int,
+        *,
+        requested_name: str,
+        requested_by: int,
+        request_message_id: int | None = None,
+    ):
+        assert self.conn
+        await self.conn.execute(
+            "INSERT INTO pending_name_approvals("
+            "chat_id,user_id,requested_name,request_message_id,requested_by,status,updated_at"
+            ") VALUES(?,?,?,?,?,'pending',datetime('now')) "
+            "ON CONFLICT(chat_id,user_id) DO UPDATE SET "
+            "requested_name=excluded.requested_name,"
+            "request_message_id=excluded.request_message_id,"
+            "approval_message_id=NULL,"
+            "requested_by=excluded.requested_by,"
+            "status='pending',"
+            "updated_at=datetime('now')",
+            (chat_id, user_id, requested_name, request_message_id, requested_by),
+        )
+        await self.conn.commit()
+
+    async def set_pending_name_approval_message(
+        self,
+        chat_id: int,
+        user_id: int,
+        approval_message_id: int,
+    ):
+        assert self.conn
+        await self.conn.execute(
+            "UPDATE pending_name_approvals "
+            "SET approval_message_id=?, updated_at=datetime('now') "
+            "WHERE chat_id=? AND user_id=? AND status='pending'",
+            (approval_message_id, chat_id, user_id),
+        )
+        await self.conn.commit()
+
+    async def get_pending_name_approval(self, chat_id: int, user_id: int) -> dict:
+        assert self.conn
+        cur = await self.conn.execute(
+            "SELECT chat_id,user_id,requested_name,request_message_id,approval_message_id,"
+            "requested_by,status,created_at,updated_at "
+            "FROM pending_name_approvals WHERE chat_id=? AND user_id=? AND status='pending'",
+            (chat_id, user_id),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else {}
+
+    async def get_pending_name_approval_by_message(self, chat_id: int, approval_message_id: int) -> dict:
+        assert self.conn
+        cur = await self.conn.execute(
+            "SELECT chat_id,user_id,requested_name,request_message_id,approval_message_id,"
+            "requested_by,status,created_at,updated_at "
+            "FROM pending_name_approvals "
+            "WHERE chat_id=? AND approval_message_id=? AND status='pending'",
+            (chat_id, approval_message_id),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else {}
+
+    async def resolve_pending_name_approval(
+        self,
+        chat_id: int,
+        user_id: int,
+        *,
+        status: str,
+        approved_display_name: str | None = None,
+    ):
+        assert self.conn
+        await self.conn.execute(
+            "UPDATE pending_name_approvals "
+            "SET status=?, updated_at=datetime('now') "
+            "WHERE chat_id=? AND user_id=? AND status='pending'",
+            (status, chat_id, user_id),
+        )
+        if status == "approved":
+            await self.upsert_user_profile(
+                chat_id,
+                user_id,
+                approved_display_name=approved_display_name,
+            )
+            return
+        await self.conn.commit()
+
     async def get_memories(self, chat_id: int, user_id: int, limit: int = 30) -> list[dict]:
         assert self.conn
         cur = await self.conn.execute(
@@ -457,6 +707,77 @@ class DB:
             (chat_id, user_id, limit),
         )
         return [dict(r) for r in await cur.fetchall()]
+
+    async def get_user_facts(
+        self,
+        chat_id: int,
+        user_id: int,
+        limit: int = 40,
+        min_importance: float = 0.0,
+    ) -> list[dict]:
+        assert self.conn
+        cur = await self.conn.execute(
+            "SELECT id,fact_type,value,normalized_value,confidence,importance,evidence,source,updated_at,last_seen_at "
+            "FROM user_facts WHERE chat_id=? AND user_id=? AND importance>=? "
+            "ORDER BY importance DESC, confidence DESC, last_seen_at DESC, updated_at DESC LIMIT ?",
+            (chat_id, user_id, float(min_importance), limit),
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def upsert_user_fact(
+        self,
+        chat_id: int,
+        user_id: int,
+        fact_type: str,
+        value: str,
+        normalized_value: str,
+        confidence: float = 0.6,
+        importance: float = 0.5,
+        evidence: str = "",
+        source: str = "",
+    ):
+        assert self.conn
+        await self.conn.execute(
+            "INSERT INTO user_facts("
+            "chat_id,user_id,fact_type,value,normalized_value,confidence,importance,evidence,source"
+            ") VALUES(?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(chat_id,user_id,fact_type,normalized_value) DO UPDATE SET "
+            "value=excluded.value,"
+            "confidence=MAX(user_facts.confidence, excluded.confidence),"
+            "importance=MAX(user_facts.importance, excluded.importance),"
+            "evidence=CASE WHEN excluded.evidence<>'' THEN excluded.evidence ELSE user_facts.evidence END,"
+            "source=CASE WHEN excluded.source<>'' THEN excluded.source ELSE user_facts.source END,"
+            "updated_at=datetime('now'),"
+            "last_seen_at=datetime('now')",
+            (
+                chat_id,
+                user_id,
+                fact_type,
+                value,
+                normalized_value,
+                confidence,
+                importance,
+                evidence,
+                source,
+            ),
+        )
+        await self.conn.commit()
+
+    async def prune_user_facts(self, chat_id: int, user_id: int, keep: int = 80):
+        assert self.conn
+        await self.conn.execute(
+            """
+            DELETE FROM user_facts
+            WHERE id IN (
+              SELECT id FROM user_facts
+              WHERE chat_id=? AND user_id=?
+              ORDER BY importance DESC, confidence DESC, last_seen_at DESC, updated_at DESC
+              LIMIT -1 OFFSET ?
+            )
+            """,
+            (chat_id, user_id, keep),
+        )
+        await self.conn.commit()
 
     async def upsert_memory(
         self,

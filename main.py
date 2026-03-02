@@ -66,6 +66,7 @@ LEADING_USER_TAG_RE = re.compile(
     re.IGNORECASE,
 )
 LEADING_ROLE_TAG_RE = re.compile(r"^\s*(?:system|user|assistant)\s*:\s*", re.IGNORECASE)
+LEADING_MENTION_ADDRESS_RE = re.compile(r"^\s*(?P<mention>@[A-Za-z][A-Za-z0-9_]{4,31})(?P<sep>[\s,.:;!?-]+)")
 LEADING_ALTA_TAG_RE = re.compile(r"^\s*(?:альта|alta)\s*:\s*", re.IGNORECASE)
 SYSTEM_LINE_RE = re.compile(
     r"^\s*(?:"
@@ -95,6 +96,30 @@ EMOJI_CHAR_RE = re.compile(
     "]+",
     flags=re.UNICODE,
 )
+NAME_REQUEST_COMMAND_RE = re.compile(r"^/(?:setname|set_name|callme)\s+(?P<name>.+)$", re.IGNORECASE)
+NAME_REQUEST_PATTERNS = (
+    re.compile(r"^(?:зови|называй)\s+меня\s+(?P<name>.+)$", re.IGNORECASE),
+    re.compile(r"^(?:можешь\s+звать|можешь\s+называть)\s+меня\s+(?P<name>.+)$", re.IGNORECASE),
+    re.compile(
+        r"^(?:обращайся\s+ко\s+мне(?:\s+как)?|можешь\s+обращаться\s+ко\s+мне(?:\s+как)?)\s+(?P<name>.+)$",
+        re.IGNORECASE,
+    ),
+)
+NAME_APPROVE_RE = re.compile(r"^(?:/approve_name|/approve_nick|одобряю|approve)\b", re.IGNORECASE)
+NAME_REJECT_RE = re.compile(r"^(?:/deny_name|/deny_nick|не\s+одобряю|deny|reject)\b", re.IGNORECASE)
+INVALID_REQUESTED_NAMES = {
+    "ты",
+    "тебя",
+    "тебе",
+    "он",
+    "она",
+    "они",
+    "никто",
+    "не знаю",
+    "unknown",
+    "none",
+    "null",
+}
 
 
 @dataclass
@@ -102,6 +127,7 @@ class JoinVerification:
     code: str
     deadline_ts: float
     task: asyncio.Task
+    join_message_id: int
 
 
 _pending_join_verification: dict[tuple[int, int], JoinVerification] = {}
@@ -219,6 +245,90 @@ def convert_bracket_mentions_to_tg(text: str) -> str:
         return f"@{username}"
 
     return BRACKET_USERNAME_RE.sub(repl, text or "")
+
+
+def sanitize_incoming_text(text: str) -> str:
+    lines = []
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            if lines and lines[-1]:
+                lines.append("")
+            continue
+        if SYSTEM_LINE_RE.match(line) or SYSTEM_META_LINE_RE.match(line):
+            continue
+
+        previous = None
+        while line and line != previous:
+            previous = line
+            line = LEADING_USER_TAG_RE.sub("", line).strip()
+            line = LEADING_ROLE_TAG_RE.sub("", line).strip()
+            line = LEADING_ALTA_TAG_RE.sub("", line).strip()
+
+        if line:
+            lines.append(line)
+
+    cleaned = "\n".join(lines).strip()
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
+
+
+def strip_foreign_leading_mention(text: str, sender_username: str | None) -> str:
+    cleaned = str(text or "").strip()
+    if not cleaned or not sender_username:
+        return cleaned
+
+    match = LEADING_MENTION_ADDRESS_RE.match(cleaned)
+    if not match:
+        return cleaned
+
+    allowed = f"@{sender_username.lstrip('@').lower()}"
+    if match.group("mention").lower() == allowed:
+        return cleaned
+    return cleaned[match.end() :].lstrip()
+
+
+def _normalize_space(text: str) -> str:
+    return " ".join(str(text or "").strip().split())
+
+
+def extract_requested_display_name(text: str) -> str | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+
+    match = NAME_REQUEST_COMMAND_RE.match(raw)
+    if match:
+        candidate = match.group("name")
+    else:
+        candidate = None
+        for pattern in NAME_REQUEST_PATTERNS:
+            match = pattern.match(raw)
+            if match:
+                candidate = match.group("name")
+                break
+        if candidate is None:
+            return None
+
+    cleaned = _normalize_space(candidate).strip(" .,!?:;\"'`«»")
+    lowered = cleaned.lower()
+    if not cleaned or len(cleaned) < 2 or len(cleaned) > 40:
+        return None
+    if cleaned.startswith("@"):
+        return None
+    if any(ch in cleaned for ch in "[]\n\r\t"):
+        return None
+    if lowered in INVALID_REQUESTED_NAMES:
+        return None
+    return cleaned
+
+
+def format_user_label(user_id: int, username: str | None, first_name: str | None = None) -> str:
+    if username:
+        return f"@{username}"
+    if first_name:
+        return first_name
+    return f"id={user_id}"
 
 
 def sanitize_outgoing_text(text: str) -> str:
@@ -343,6 +453,11 @@ async def main():
             pass
 
         try:
+            await bot.delete_message(chat_id=chat_id, message_id=state.join_message_id)
+        except Exception:
+            pass
+
+        try:
             await bot.ban_chat_member(
                 chat_id=chat_id,
                 user_id=user_id,
@@ -379,7 +494,10 @@ async def main():
             timeout_sec = max(20, cfg.join_verification_timeout_sec)
             task = asyncio.create_task(schedule_join_timeout(chat_id, m.id, timeout_sec))
             _pending_join_verification[key] = JoinVerification(
-                code=code, deadline_ts=time.time() + timeout_sec, task=task
+                code=code,
+                deadline_ts=time.time() + timeout_sec,
+                task=task,
+                join_message_id=message.message_id,
             )
 
             who = f"@{m.username}" if m.username else (m.first_name or "новый участник")
@@ -445,6 +563,52 @@ async def main():
                     )
             return
 
+        approval_text = sanitize_incoming_text(text)
+        if (
+            cfg.creator_user_id is not None
+            and user_id == cfg.creator_user_id
+            and message.reply_to_message
+            and message.reply_to_message.from_user
+            and message.reply_to_message.from_user.id == bot_id
+        ):
+            pending_name = await db.get_pending_name_approval_by_message(
+                chat_id,
+                message.reply_to_message.message_id,
+            )
+            if pending_name:
+                if NAME_APPROVE_RE.match(approval_text):
+                    target_user = await db.get_user(int(pending_name["user_id"]))
+                    await db.resolve_pending_name_approval(
+                        chat_id,
+                        int(pending_name["user_id"]),
+                        status="approved",
+                        approved_display_name=str(pending_name["requested_name"]),
+                    )
+                    who = format_user_label(
+                        int(pending_name["user_id"]),
+                        target_user.get("username"),
+                    )
+                    await message.reply(
+                        f"Ок. Буду обращаться к {who} как «{pending_name['requested_name']}»."
+                    )
+                    print(
+                        f"[NAME-APPROVAL] approved user={pending_name['user_id']} "
+                        f"chat={chat_id} name={pending_name['requested_name']!r}"
+                    )
+                    return
+                if NAME_REJECT_RE.match(approval_text):
+                    await db.resolve_pending_name_approval(
+                        chat_id,
+                        int(pending_name["user_id"]),
+                        status="rejected",
+                    )
+                    await message.reply("Ок, не меняю обращение.")
+                    print(
+                        f"[NAME-APPROVAL] rejected user={pending_name['user_id']} "
+                        f"chat={chat_id} name={pending_name['requested_name']!r}"
+                    )
+                    return
+
         if not is_trigger(message, bot_username, bot_id):
             print("[SKIP] no trigger")
             return
@@ -453,7 +617,8 @@ async def main():
             print("[SKIP] cooldown")
             return
 
-        clean_text = strip_mention(text, bot_username)
+        clean_text = sanitize_incoming_text(strip_mention(text, bot_username))
+        requested_display_name = extract_requested_display_name(clean_text)
         mention_only = False
         if not clean_text:
             mention_only = True
@@ -467,6 +632,7 @@ async def main():
                 or (reply_source.sticker.emoji if reply_source.sticker else "")
                 or "[non-text message]"
             )
+            reply_text = sanitize_incoming_text(reply_text)
             reply_context = ReplyContext(
                 user_id=reply_source.from_user.id,
                 username=reply_source.from_user.username,
@@ -533,6 +699,51 @@ async def main():
                             return
 
                 await db.add_message(chat_id, user_id, "user", clean_text)
+                if requested_display_name:
+                    if cfg.creator_user_id is None:
+                        await message.reply(
+                            "Не могу поменять обращение: не настроен пользователь, который это одобряет."
+                        )
+                        return
+
+                    if user_id == cfg.creator_user_id:
+                        await db.upsert_user_profile(
+                            chat_id,
+                            user_id,
+                            approved_display_name=requested_display_name,
+                        )
+                        await message.reply(
+                            f"Ок. Буду обращаться к тебе как «{requested_display_name}»."
+                        )
+                        print(
+                            f"[NAME-APPROVAL] self-approved user={user_id} "
+                            f"chat={chat_id} name={requested_display_name!r}"
+                        )
+                        return
+
+                    await db.create_pending_name_approval(
+                        chat_id,
+                        user_id,
+                        requested_name=requested_display_name,
+                        requested_by=user_id,
+                        request_message_id=message.message_id,
+                    )
+                    requester = format_user_label(user_id, username, first_name)
+                    approval_prompt = await message.reply(
+                        f"{requester} хочет, чтобы я обращалась к нему как «{requested_display_name}».\n"
+                        f"Если одобряешь, ответь на это сообщение: /approve_name\n"
+                        f"Если нет, ответь: /deny_name"
+                    )
+                    await db.set_pending_name_approval_message(
+                        chat_id,
+                        user_id,
+                        approval_prompt.message_id,
+                    )
+                    print(
+                        f"[NAME-APPROVAL] requested user={user_id} "
+                        f"chat={chat_id} name={requested_display_name!r}"
+                    )
+                    return
                 await bot.send_chat_action(chat_id, "typing")
 
                 try:
@@ -569,7 +780,9 @@ async def main():
                     print("[WARN] empty answer")
                     return
 
-                answer = sanitize_outgoing_text(convert_bracket_mentions_to_tg(answer))
+                answer = convert_bracket_mentions_to_tg(answer)
+                answer = sanitize_outgoing_text(answer)
+                answer = strip_foreign_leading_mention(answer, username)
                 await message.reply(answer)
                 await db.add_message(chat_id, bot_id, "assistant", answer, target_user_id=user_id)
                 print(f"[OUT] {answer!r}")

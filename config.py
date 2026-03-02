@@ -65,8 +65,11 @@ def load_config() -> Config:
         allowed_chat_ids=_parse_chat_ids(os.getenv("ALLOWED_CHAT_IDS", "")),
         llm_base_url=os.getenv("LLM_BASE_URL", "http://127.0.0.1:8080/v1").strip(),
         llm_api_key=os.getenv("LLM_API_KEY", "local-llm").strip(),
-        llm_model=os.getenv("LLM_MODEL", "saiga_nemo_12b.Q8_0.gguf").strip(),
-        llm_context_window=int(os.getenv("LLM_CONTEXT_WINDOW", "4096")),
+        llm_model=os.getenv(
+            "LLM_MODEL",
+            "Mistral-Small-3.2-24B-Instruct-2506-UD-Q4_K_XL.gguf",
+        ).strip(),
+        llm_context_window=int(os.getenv("LLM_CONTEXT_WINDOW", "8000")),
         llm_context_safety_margin=int(os.getenv("LLM_CONTEXT_SAFETY_MARGIN", "512")),
         db_path=os.getenv("DB_PATH", "./alta_tg_test.db").strip(),
         history_limit=int(os.getenv("HISTORY_LIMIT", "40")),

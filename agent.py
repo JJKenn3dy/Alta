@@ -11,19 +11,19 @@ from telemetry import approx_messages_tokens, approx_text_tokens
 
 SUMMARY_EVERY_N_MESSAGES = 20
 SUMMARY_HISTORY_WINDOW = 80
-MAX_MEMORY_ITEMS_PER_TURN = 5
+MAX_FACT_ITEMS_PER_TURN = 6
 INTRO_MARKER_KEY = "_intro_requested"
 IDENTITY_KEYS = {"name", "preferred_name", "gender", "pronouns", "nickname"}
 STYLE_KEYS = {"communication_style", "response_preference"}
 HIGH_PRIORITY_KEYS = IDENTITY_KEYS | STYLE_KEYS
 MEMORY_STORE_MIN_IMPORTANCE = 0.45
-MEMORY_KEEP_PER_USER = 48
-MEMORY_CONTEXT_MIN_IMPORTANCE = 0.5
+FACT_KEEP_PER_USER = 80
+FACT_CONTEXT_MIN_IMPORTANCE = 0.45
 CONTEXT_HISTORY_LIMIT = 20
 SUMMARY_CONTEXT_CHAR_LIMIT = 500
 PROFILE_FIELD_CHAR_LIMIT = 120
 RELATIONSHIP_NOTES_CHAR_LIMIT = 160
-MAX_MEMORY_LINES_IN_CONTEXT = 5
+MAX_FACT_LINES_IN_CONTEXT = 6
 SUMMARY_INPUT_CHAR_LIMIT = 6_000
 MEMORY_EXTRACT_INPUT_CHAR_LIMIT = 1_800
 PROFILE_EXTRACT_INPUT_CHAR_LIMIT = 2_200
@@ -39,7 +39,19 @@ DEFAULT_FILE_CONTEXT_CHARS = 1_800
 COMPACT_FILE_CONTEXT_CHARS = 1_000
 MINIMAL_FILE_CONTEXT_CHARS = 500
 USER_DOCUMENT_CHAR_LIMIT = 900
-USER_DOCUMENT_FACT_LIMIT = 16
+USER_DOCUMENT_FACT_LIMIT = 20
+
+FACT_TYPE_LABELS = {
+    "interest": "Интерес",
+    "preference": "Предпочтение",
+    "work": "Работа",
+    "study": "Учеба",
+    "location": "Локация",
+    "goal": "Цель",
+    "relationship": "По общению",
+    "bio": "О себе",
+    "fact": "Факт",
+}
 
 USER_DOCUMENT_TRIGGER_PATTERNS = (
     re.compile(r"\b(кто я|что ты обо мне|что знаешь обо мне|что помнишь обо мне)\b", re.IGNORECASE),
@@ -156,19 +168,19 @@ SUMMARY_SYSTEM_PROMPT = """
 MEMORY_EXTRACT_PROMPT = """
 Извлеки только устойчивые факты о пользователе из сообщения.
 Верни строго JSON-массив объектов формата:
-[{"key":"...", "value":"...", "confidence":0.0, "importance":0.0}]
+[{"fact_type":"...", "value":"...", "confidence":0.0, "importance":0.0, "evidence":"..."}]
 
 Правила:
 - Только личные факты и предпочтения, которые пригодятся позже.
 - Сообщение может быть из группового чата: извлекай факты только про автора текущего сообщения, а не про людей, которых он упомянул.
-- Особенно важно извлекать: имя/ник, как обращаться, пол/местоимения, интересы.
-- Для пола используй key="gender" и короткое значение.
-- Для имени используй key="name", для предпочтительного обращения key="preferred_name", для ника key="nickname".
+- Не извлекай имя, ник, пол, местоимения, стиль ответа и прочие identity-поля: они обрабатываются отдельно.
+- Используй только fact_type из набора: interest, preference, work, study, location, goal, relationship, bio, fact.
+- evidence: короткая цитата или опора из сообщения, максимум 120 символов.
 - importance от 0.0 до 1.0: 1.0 это факт, который стоит помнить очень долго; 0.0 это почти мусор.
 - Не сохраняй как важное временные мелочи вроде "сейчас ем", "сегодня устал", если это не ключ к личности.
-- Не записывай обращения собеседника, местоимения и заглушки как имя/ник/пол: "ты", "он", "она", "неизвестно", "неопределено" и похожее запрещены.
+- Не сохраняй случайный шум, сиюминутные эмоции, мемные вбросы без устойчивого смысла и факты о третьих лицах.
 - Не добавляй временный шум.
-- Максимум 3 объекта.
+- Максимум 6 объектов.
 - confidence от 0.0 до 1.0.
 - Если извлекать нечего, верни [].
 """.strip()
@@ -265,7 +277,7 @@ def _build_context_plans(max_tokens: int, history_limit: int) -> list[ContextPla
             history_messages=min(history_limit, CONTEXT_HISTORY_LIMIT),
             history_chars=DEFAULT_CONTEXT_CHAR_BUDGET,
             summary_chars=SUMMARY_CONTEXT_CHAR_LIMIT,
-            memory_lines=MAX_MEMORY_LINES_IN_CONTEXT,
+            memory_lines=MAX_FACT_LINES_IN_CONTEXT,
             file_chunks=DEFAULT_FILE_CONTEXT_CHUNKS,
             file_chars=DEFAULT_FILE_CONTEXT_CHARS,
             max_tokens=safe_max_tokens,
@@ -273,7 +285,7 @@ def _build_context_plans(max_tokens: int, history_limit: int) -> list[ContextPla
         ),
         ContextPlan(
             name="compact",
-            history_messages=min(history_limit, max(6, CONTEXT_HISTORY_LIMIT // 2 + 1)),
+            history_messages=min(history_limit, 17),
             history_chars=COMPACT_CONTEXT_CHAR_BUDGET,
             summary_chars=min(320, SUMMARY_CONTEXT_CHAR_LIMIT),
             memory_lines=1,
@@ -284,7 +296,7 @@ def _build_context_plans(max_tokens: int, history_limit: int) -> list[ContextPla
         ),
         ContextPlan(
             name="minimal",
-            history_messages=min(history_limit, 4),
+            history_messages=min(history_limit, 8),
             history_chars=MINIMAL_CONTEXT_CHAR_BUDGET,
             summary_chars=min(220, SUMMARY_CONTEXT_CHAR_LIMIT),
             memory_lines=0,
@@ -355,6 +367,45 @@ def build_reply_context_block(reply_context: ReplyContext | None) -> str:
         f"Автор исходной реплики: {_format_reply_author(reply_context)}\n"
         f"Текст исходной реплики: {reply_text}\n"
         "Учитывай это при интерпретации коротких и зависимых от контекста ответов."
+    ).strip()
+
+
+def _looks_like_context_dependent_reply(text: str) -> bool:
+    value = " ".join(str(text or "").strip().lower().split())
+    if not value:
+        return False
+    if "?" in value:
+        return False
+    if len(value) > 48:
+        return False
+    words = value.split()
+    if len(words) > 6:
+        return False
+    return True
+
+
+def build_implicit_reply_context_block(history: list[dict], input_text: str) -> str:
+    if not _looks_like_context_dependent_reply(input_text):
+        return ""
+    if len(history) < 2:
+        return ""
+
+    last_message = history[-1]
+    prev_message = history[-2]
+    if last_message.get("role") != "user":
+        return ""
+    if prev_message.get("role") != "assistant":
+        return ""
+
+    prev_text = _fit_text(prev_message.get("content", ""), 300)
+    if not prev_text or "?" not in prev_text:
+        return ""
+
+    return (
+        "Текущее сообщение короткое и зависит от предыдущей реплики бота.\n"
+        f"Предыдущая реплика бота: {prev_text}\n"
+        "Считай текущее сообщение прежде всего ответом на этот вопрос или уточнением к нему, "
+        "а не новой отдельной темой."
     ).strip()
 
 
@@ -564,23 +615,59 @@ def _history_as_text(history: list[dict], max_chars: int) -> str:
     return "\n".join(_history_line(item["role"], item["content"]) for item in selected)
 
 
-def format_memories(memories: list[dict], max_lines: int = MAX_MEMORY_LINES_IN_CONTEXT) -> str:
-    if not memories:
+def _normalize_fact_type(value: Any) -> str:
+    text = " ".join(str(value or "").strip().lower().split())
+    aliases = {
+        "interests": "interest",
+        "hobby": "interest",
+        "hobbies": "interest",
+        "likes": "interest",
+        "pref": "preference",
+        "preferences": "preference",
+        "workplace": "work",
+        "job": "work",
+        "occupation": "work",
+        "education": "study",
+        "city": "location",
+        "place": "location",
+        "plan": "goal",
+        "plans": "goal",
+        "relationship_notes": "relationship",
+        "communication": "relationship",
+    }
+    text = aliases.get(text, text)
+    return text if text in FACT_TYPE_LABELS else "fact"
+
+
+def _normalize_fact_value(value: Any) -> str:
+    return " ".join(str(value or "").strip().split())
+
+
+def _normalize_fact_evidence(value: Any) -> str:
+    return _fit_text(" ".join(str(value or "").strip().split()), 120)
+
+
+def _fact_signature(fact_type: str, normalized_value: str) -> str:
+    return f"{fact_type}::{normalized_value}"
+
+
+def format_user_facts(facts: list[dict], max_lines: int = MAX_FACT_LINES_IN_CONTEXT) -> str:
+    if not facts:
         return ""
     lines = []
-    for m in memories:
-        key = str(m.get("key", "")).strip()
-        if not key or key.startswith("_") or key in IDENTITY_KEYS or key in STYLE_KEYS:
+    for fact in facts:
+        fact_type = _normalize_fact_type(fact.get("fact_type"))
+        value = _normalize_fact_value(fact.get("value"))
+        if not value:
             continue
         try:
-            importance = float(m.get("importance", 0.0))
+            importance = float(fact.get("importance", 0.0))
         except (TypeError, ValueError):
             importance = 0.0
-        if importance < MEMORY_CONTEXT_MIN_IMPORTANCE:
+        if importance < FACT_CONTEXT_MIN_IMPORTANCE:
             continue
-        lines.append(
-            f"- {key}: {m['value']} (c={m['confidence']}, i={m.get('importance', 0.5)})"
-        )
+        label = FACT_TYPE_LABELS.get(fact_type, "Факт")
+        lines.append(f"- {label}: {value}")
         if len(lines) >= max_lines:
             break
     return "\n".join(lines)
@@ -640,32 +727,45 @@ def _compute_profile_changes(current: dict[str, Any], candidate: dict[str, Any])
     return len(changed_fields), changed_fields
 
 
+def _trusted_sender_identity(
+    user_profile: dict[str, Any],
+    sender_username: str | None,
+    sender_first_name: str | None,
+) -> tuple[str | None, str | None]:
+    approved_display_name = _clean_identity_profile_text(
+        user_profile.get("approved_display_name"),
+        limit=80,
+        field="display_name",
+    )
+    display_name = approved_display_name or _clean_identity_profile_text(
+        sender_first_name,
+        limit=80,
+        field="display_name",
+    )
+    nickname = None
+    if sender_username:
+        nickname = _clean_identity_profile_text(
+            f"@{sender_username.lstrip('@')}",
+            limit=80,
+            field="nickname",
+        )
+    return display_name, nickname
+
+
 def build_user_document_payload(
-    memories: list[dict],
+    user_facts: list[dict],
     user_profile: dict,
     sender_username: str | None,
     sender_first_name: str | None,
+    memories: list[dict] | None = None,
 ) -> dict[str, Any]:
-    mm = _memory_map(memories)
-
     identity: dict[str, str] = {}
-    display_name = (
-        user_profile.get("display_name")
-        or mm.get("preferred_name")
-        or mm.get("name")
-        or (sender_first_name or "").strip()
-    )
-    nickname = user_profile.get("nickname") or mm.get("nickname")
-    if not nickname and sender_username:
-        nickname = f"@{sender_username.lstrip('@')}"
-    gender = user_profile.get("gender") or mm.get("gender")
+    display_name, nickname = _trusted_sender_identity(user_profile, sender_username, sender_first_name)
 
     if display_name:
         identity["display_name"] = str(display_name).strip()
     if nickname:
         identity["nickname"] = str(nickname).strip()
-    if gender:
-        identity["gender"] = str(gender).strip()
 
     preferences: dict[str, str] = {}
     for key, field in (
@@ -677,21 +777,26 @@ def build_user_document_payload(
         if value:
             preferences[key] = value
 
-    interests = _join_list(user_profile.get("interests"))
+    interests = _profile_text_or_list(user_profile.get("interests"))
     facts: list[dict[str, Any]] = []
-    for memory in memories:
-        key = str(memory.get("key", "")).strip()
-        if not key or key.startswith("_"):
-            continue
-        value = str(memory.get("value", "")).strip()
+    seen_signatures: set[str] = set()
+    for fact in user_facts:
+        fact_type = _normalize_fact_type(fact.get("fact_type"))
+        value = _normalize_fact_value(fact.get("value"))
+        normalized_value = _normalize_fact_value(fact.get("normalized_value")) or value.lower()
         if not value:
             continue
+        signature = _fact_signature(fact_type, normalized_value)
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
         facts.append(
             {
-                "key": key,
+                "fact_type": fact_type,
+                "label": FACT_TYPE_LABELS.get(fact_type, "Факт"),
                 "value": value[:180],
-                "confidence": float(memory.get("confidence", 0.0) or 0.0),
-                "importance": float(memory.get("importance", 0.0) or 0.0),
+                "confidence": float(fact.get("confidence", 0.0) or 0.0),
+                "importance": float(fact.get("importance", 0.0) or 0.0),
             }
         )
         if len(facts) >= USER_DOCUMENT_FACT_LIMIT:
@@ -730,7 +835,7 @@ def render_user_document_text(payload: dict[str, Any], limit: int = USER_DOCUMEN
     if facts:
         lines.append("- Доп. факты:")
         for fact in facts[:USER_DOCUMENT_FACT_LIMIT]:
-            lines.append(f"  - {fact['key']}: {fact['value']}")
+            lines.append(f"  - {fact['label']}: {fact['value']}")
 
     text = "\n".join(lines).strip()
     return _fit_text(text, limit)
@@ -794,6 +899,29 @@ def _is_invalid_gender_value(value: Any) -> bool:
     return _normalize_compact_text(value) in INVALID_GENDER_VALUES
 
 
+def _clean_fact_value(value: Any) -> str | None:
+    text = _normalize_fact_value(value)
+    if not text:
+        return None
+    if len(text) < 2:
+        return None
+    lowered = text.lower()
+    blocked = {
+        "да",
+        "нет",
+        "ага",
+        "ок",
+        "норм",
+        "ничего",
+        "не знаю",
+        "хз",
+        "лол",
+    }
+    if lowered in blocked:
+        return None
+    return text[:240]
+
+
 def _clean_memory_value(key: str, value: Any) -> str | None:
     text = " ".join(str(value or "").strip().split())
     if not text:
@@ -825,6 +953,41 @@ def _clean_identity_profile_text(
     return text
 
 
+def _fact_record_map(facts: list[dict]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for fact in facts:
+        fact_type = _normalize_fact_type(fact.get("fact_type"))
+        normalized_value = _normalize_fact_value(fact.get("normalized_value")) or _normalize_fact_value(
+            fact.get("value")
+        ).lower()
+        if not normalized_value:
+            continue
+        signature = _fact_signature(fact_type, normalized_value)
+        if signature not in out:
+            out[signature] = dict(fact)
+    return out
+
+
+def _would_change_fact(
+    current: dict[str, Any] | None,
+    *,
+    confidence: float,
+    importance: float,
+    evidence: str,
+    source: str,
+) -> bool:
+    if not current:
+        return True
+    return any(
+        (
+            float(current.get("confidence", 0.0) or 0.0) < float(confidence),
+            float(current.get("importance", 0.0) or 0.0) < float(importance),
+            str(current.get("evidence", "")).strip() != str(evidence).strip() and bool(evidence),
+            str(current.get("source", "")).strip() != str(source).strip() and bool(source),
+        )
+    )
+
+
 def _is_creator_profile_query(text: str) -> bool:
     normalized = " ".join((text or "").lower().split())
     return any(pattern.search(normalized) for pattern in CREATOR_PROFILE_PATTERNS)
@@ -836,19 +999,8 @@ def build_identity_block(
     sender_username: str | None,
     sender_first_name: str | None,
 ) -> str:
-    mm = _memory_map(memories)
-
-    preferred_name = (
-        user_profile.get("display_name")
-        or mm.get("preferred_name")
-        or mm.get("name")
-        or (sender_first_name or "").strip()
-    )
-    nickname = user_profile.get("nickname") or mm.get("nickname")
-    if not nickname and sender_username:
-        nickname = f"@{sender_username.lstrip('@')}"
-
-    gender = user_profile.get("gender") or mm.get("gender")
+    preferred_name, nickname = _trusted_sender_identity(user_profile, sender_username, sender_first_name)
+    gender = None
     interests = _clip_text(user_profile.get("interests"), PROFILE_FIELD_CHAR_LIMIT)
     communication_style = _clip_text(
         user_profile.get("communication_style"),
@@ -985,6 +1137,12 @@ def _join_list(value: Any, limit: int = 4) -> str:
     return ", ".join(items)
 
 
+def _profile_text_or_list(value: Any, limit: int = 4) -> str:
+    if isinstance(value, list):
+        return _join_list(value, limit=limit)
+    return _clip_text(value, 180)
+
+
 def _normalize_importance(key: str, importance: Any, confidence: float) -> float:
     try:
         score = float(importance)
@@ -994,7 +1152,21 @@ def _normalize_importance(key: str, importance: Any, confidence: float) -> float
     score = max(0.0, min(1.0, score))
     if key in HIGH_PRIORITY_KEYS:
         score = max(score, 0.88)
-    elif key in {"interests", "job", "work", "hobby", "relationship_notes"}:
+    elif key in {
+        "interests",
+        "job",
+        "work",
+        "hobby",
+        "relationship_notes",
+        "interest",
+        "preference",
+        "study",
+        "location",
+        "goal",
+        "relationship",
+        "bio",
+        "fact",
+    }:
         score = max(score, 0.65)
     return score
 
@@ -1062,6 +1234,11 @@ async def maybe_update_summary(
             f"РќРѕРІС‹Рµ СЃРѕРѕР±С‰РµРЅРёСЏ:\n{user_history_text}\n\n"
             f"РћР±РЅРѕРІРё СЂРµР·СЋРјРµ."
         )
+        user_summary_input = (
+            f"Текущее резюме:\n{current_user_summary or '(пусто)'}\n\n"
+            f"Новые сообщения:\n{user_history_text}\n\n"
+            f"Обнови резюме."
+        )
         try:
             new_user_summary = await llm.chat(
                 SUMMARY_SYSTEM_PROMPT,
@@ -1109,53 +1286,58 @@ async def maybe_store_memories(
     except Exception:
         return {"attempted": 0, "changed": 0}
 
-    items = _extract_json_array(raw)[:MAX_MEMORY_ITEMS_PER_TURN]
-    current_memories = _memory_record_map(await db.get_memories(chat_id, user_id, limit=64))
+    items = _extract_json_array(raw)[:MAX_FACT_ITEMS_PER_TURN]
+    current_facts = _fact_record_map(await db.get_user_facts(chat_id, user_id, limit=128))
     attempted_count = 0
     changed_count = 0
     for item in items:
         if not isinstance(item, dict):
             continue
-        key = str(item.get("key", "")).strip().lower()[:80]
-        value = _clean_memory_value(key, item.get("value"))
-        if not key or not value:
+        fact_type = _normalize_fact_type(item.get("fact_type"))
+        value = _clean_fact_value(item.get("value"))
+        if not value:
             continue
+        normalized_value = _normalize_fact_value(value).lower()
         try:
             confidence = float(item.get("confidence", 0.6))
         except (TypeError, ValueError):
             confidence = 0.6
         confidence = max(0.0, min(1.0, confidence))
-        if key in IDENTITY_KEYS and confidence < 0.8:
-            continue
-        importance = _normalize_importance(key, item.get("importance"), confidence)
+        evidence = _normalize_fact_evidence(item.get("evidence"))
+        importance = _normalize_importance(fact_type, item.get("importance"), confidence)
         if importance < MEMORY_STORE_MIN_IMPORTANCE:
             continue
+        signature = _fact_signature(fact_type, normalized_value)
         attempted_count += 1
-        if _would_change_memory(
-            current_memories.get(key),
-            value=value,
+        if _would_change_fact(
+            current_facts.get(signature),
             confidence=confidence,
             importance=importance,
+            evidence=evidence,
             source="auto_extract",
         ):
             changed_count += 1
-        await db.upsert_memory(
+        await db.upsert_user_fact(
             chat_id,
             user_id,
-            key,
+            fact_type,
             value,
+            normalized_value,
             confidence,
             importance,
+            evidence,
             source="auto_extract",
         )
-        current_memories[key] = {
-            "key": key,
+        current_facts[signature] = {
+            "fact_type": fact_type,
             "value": value,
+            "normalized_value": normalized_value,
             "confidence": confidence,
             "importance": importance,
+            "evidence": evidence,
             "source": "auto_extract",
         }
-    await db.prune_memories(chat_id, user_id, keep=MEMORY_KEEP_PER_USER)
+    await db.prune_user_facts(chat_id, user_id, keep=FACT_KEEP_PER_USER)
     return {"attempted": attempted_count, "changed": changed_count}
 
 
@@ -1208,21 +1390,6 @@ async def maybe_store_user_profile(
         confidence = current_profile.get("profile_confidence", 0.0)
     confidence = max(0.0, min(1.0, confidence))
 
-    cleaned_display_name = _clean_identity_profile_text(
-        profile.get("display_name"),
-        limit=80,
-        field="display_name",
-    )
-    cleaned_nickname = _clean_identity_profile_text(
-        profile.get("nickname"),
-        limit=80,
-        field="nickname",
-    )
-    cleaned_gender = _clean_identity_profile_text(
-        profile.get("gender"),
-        limit=40,
-        field="gender",
-    )
     interests = _join_list(profile.get("interests"))
     communication_style = _clean_profile_text(
         profile.get("communication_style"),
@@ -1239,9 +1406,6 @@ async def maybe_store_user_profile(
     await db.upsert_user_profile(
         chat_id,
         user_id,
-        display_name=cleaned_display_name,
-        nickname=cleaned_nickname,
-        gender=cleaned_gender,
         interests=interests,
         communication_style=communication_style,
         response_preference=response_preference,
@@ -1249,9 +1413,6 @@ async def maybe_store_user_profile(
         profile_confidence=confidence,
     )
     attempted_profile = {
-        "display_name": cleaned_display_name,
-        "nickname": cleaned_nickname,
-        "gender": cleaned_gender,
         "interests": interests,
         "communication_style": communication_style,
         "response_preference": response_preference,
@@ -1372,12 +1533,14 @@ async def sync_user_document(
     sender_first_name: str | None,
 ):
     memories = await db.get_memories(chat_id, user_id)
+    user_facts = await db.get_user_facts(chat_id, user_id, limit=FACT_KEEP_PER_USER)
     user_profile = await db.get_user_profile(chat_id, user_id)
     payload = build_user_document_payload(
-        memories,
+        user_facts,
         user_profile,
         sender_username,
         sender_first_name,
+        memories,
     )
     await db.upsert_user_document(
         chat_id,
@@ -1396,7 +1559,9 @@ async def should_ask_intro(db, chat_id: int, user_id: int, input_text: str) -> b
     memories = await db.get_memories(chat_id, user_id)
     memory_map = _memory_map(memories)
 
-    has_display_name = bool((profile.get("display_name") or "").strip())
+    has_display_name = bool(
+        (profile.get("approved_display_name") or profile.get("display_name") or "").strip()
+    )
     has_nickname = bool((profile.get("nickname") or "").strip())
     has_memory_name = any(memory_map.get(key) for key in ("preferred_name", "name", "nickname"))
 
@@ -1431,6 +1596,7 @@ async def build_context(
     summary = await db.get_summary(chat_id)
     speaker_summary = await db.get_summary(chat_id, user_id)
     memories = await db.get_memories(chat_id, user_id)
+    user_facts = await db.get_user_facts(chat_id, user_id, limit=FACT_KEEP_PER_USER)
     user_profile = await db.get_user_profile(chat_id, user_id)
     user_document = await db.get_user_document(chat_id, user_id)
     focused_history = await db.get_last_messages(
@@ -1445,6 +1611,7 @@ async def build_context(
     )
     history = _merge_histories(focused_history, shared_history, plan.history_messages, plan.history_chars)
     prompt_history = [{"role": item["role"], "content": item["content"]} for item in history]
+    implicit_reply_block = build_implicit_reply_context_block(prompt_history, input_text)
 
     system_blocks = [
         {
@@ -1461,6 +1628,14 @@ async def build_context(
             "label": "current_speaker",
         }
     ]
+    if implicit_reply_block:
+        system_blocks.append(
+            {
+                "content": implicit_reply_block,
+                "bucket": "system",
+                "label": "implicit_reply_context",
+            }
+        )
     mention_only_block = build_mention_only_block(mention_only)
     if mention_only_block:
         system_blocks.append(
@@ -1511,7 +1686,7 @@ async def build_context(
     if identity_block:
         system_blocks.append({"content": identity_block, "bucket": "system", "label": "identity"})
 
-    mem_text = format_memories(memories, max_lines=plan.memory_lines)
+    mem_text = format_user_facts(user_facts, max_lines=plan.memory_lines)
     if mem_text:
         system_blocks.append(
             {
@@ -1611,7 +1786,11 @@ def _compose_system_prompt(
     }
 
 
-def _measure_context_snapshot(system_prompt: str, system_blocks: list[str], history: list[dict]) -> dict[str, int]:
+def _measure_context_snapshot(
+    system_prompt: str,
+    system_blocks: list[dict[str, str]],
+    history: list[dict],
+) -> dict[str, int]:
     summary_tokens = 0
     memory_tokens = 0
     rag_tokens = 0
@@ -1621,10 +1800,31 @@ def _measure_context_snapshot(system_prompt: str, system_blocks: list[str], hist
     reply_context_tokens = 0
 
     for block in system_blocks:
-        text = str(block or "")
+        text = str((block or {}).get("content") or "")
         if not text:
             continue
         tokens = approx_text_tokens(text)
+        bucket = str((block or {}).get("bucket") or "")
+        label = str((block or {}).get("label") or "")
+        if bucket == "summary":
+            summary_tokens += tokens
+            continue
+        if bucket == "memory":
+            memory_tokens += tokens
+            continue
+        if bucket == "rag":
+            rag_tokens += tokens
+            continue
+        if label == "identity":
+            identity_tokens += tokens
+        if label == "current_speaker":
+            current_speaker_tokens += tokens
+        if label == "reply_context":
+            reply_context_tokens += tokens
+        if label == "user_document":
+            user_document_tokens += tokens
+        if label in {"identity", "current_speaker", "reply_context", "user_document"}:
+            continue
         if "РљСЂР°С‚РєРѕРµ СЂРµР·СЋРјРµ" in text:
             summary_tokens += tokens
         elif "Р—Р°РјРµС‚РєРё Рѕ СЃРѕР±РµСЃРµРґРЅРёРєРµ:" in text:
