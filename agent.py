@@ -1,7 +1,10 @@
 import json
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any
+
+log = logging.getLogger("alta.agent")
 
 from file_context import build_file_context_block, retrieve_context_snippets, sync_context_dir
 from llm import ContextOverflowError
@@ -590,24 +593,36 @@ def _take_history_with_budget(history: list[dict], max_messages: int, max_chars:
         return []
 
     selected: list[dict] = []
+    skipped_count = 0
     chars_used = 0
     recent = list(reversed(history[-max_messages:]))
 
     for index, message in enumerate(recent):
         remaining = max_chars - chars_used
         if remaining <= 80:
+            skipped_count += len(recent) - index
             break
 
         per_message_limit = min(HISTORY_MESSAGE_CHAR_LIMIT, max(120, remaining - 24))
         shrunk = _shrink_message(message, per_message_limit)
         cost = len(shrunk["content"]) + 24
-        if index > 0 and chars_used + cost > max_chars:
+        if chars_used + cost > max_chars:
+            skipped_count += 1
             continue
 
         selected.append(shrunk)
         chars_used += cost
 
-    return list(reversed(selected))
+    result = list(reversed(selected))
+
+    if skipped_count > 0 and result:
+        gap_note = {
+            "role": "system",
+            "content": f"[... пропущено {skipped_count} сообщений из-за лимита контекста ...]",
+        }
+        result.insert(0, gap_note)
+
+    return result
 
 
 def _history_as_text(history: list[dict], max_chars: int) -> str:
@@ -757,7 +772,6 @@ def build_user_document_payload(
     user_profile: dict,
     sender_username: str | None,
     sender_first_name: str | None,
-    memories: list[dict] | None = None,
 ) -> dict[str, Any]:
     identity: dict[str, str] = {}
     display_name, nickname = _trusted_sender_identity(user_profile, sender_username, sender_first_name)
@@ -994,13 +1008,12 @@ def _is_creator_profile_query(text: str) -> bool:
 
 
 def build_identity_block(
-    memories: list[dict],
     user_profile: dict,
     sender_username: str | None,
     sender_first_name: str | None,
 ) -> str:
     preferred_name, nickname = _trusted_sender_identity(user_profile, sender_username, sender_first_name)
-    gender = None
+    gender = _clip_text(user_profile.get("gender"), PROFILE_FIELD_CHAR_LIMIT)
     interests = _clip_text(user_profile.get("interests"), PROFILE_FIELD_CHAR_LIMIT)
     communication_style = _clip_text(
         user_profile.get("communication_style"),
@@ -1016,10 +1029,10 @@ def build_identity_block(
     )
 
     lines = []
-    if preferred_name:
+    # Skip preferred_name if it's just the telegram first_name (already in current_speaker block)
+    if preferred_name and preferred_name.strip() != (sender_first_name or "").strip():
         lines.append(f"- Предпочтительное обращение: {preferred_name}")
-    if nickname:
-        lines.append(f"- Ник в Telegram: {nickname}")
+    # Skip nickname — already shown as @username in current_speaker block
     if gender:
         lines.append(f"- Пол: {gender}")
     if interests:
@@ -1219,7 +1232,7 @@ async def maybe_update_summary(
             await db.set_summary(chat_id, normalized_summary)
             updated = True
     except Exception:
-        pass
+        log.warning("failed to update chat summary chat=%s", chat_id, exc_info=True)
 
     if should_update_user_summary:
         current_user_summary = await db.get_summary(chat_id, user_id)
@@ -1254,7 +1267,14 @@ async def maybe_update_summary(
                 await db.set_summary(chat_id, normalized_user_summary, user_id=user_id)
                 updated = True
         except Exception:
-            pass
+            log.warning("failed to update user summary chat=%s user=%s", chat_id, user_id, exc_info=True)
+
+    if updated and message_count > 2000:
+        try:
+            await db.rotate_messages(chat_id, keep=2000)
+        except Exception:
+            log.warning("failed to rotate messages chat=%s", chat_id, exc_info=True)
+
     return updated
 
 
@@ -1284,6 +1304,7 @@ async def maybe_store_memories(
             turn_metrics=turn_metrics,
         )
     except Exception:
+        log.debug("memory extraction LLM call failed", exc_info=True)
         return {"attempted": 0, "changed": 0}
 
     items = _extract_json_array(raw)[:MAX_FACT_ITEMS_PER_TURN]
@@ -1378,6 +1399,7 @@ async def maybe_store_user_profile(
             turn_metrics=turn_metrics,
         )
     except Exception:
+        log.debug("profile extraction LLM call failed", exc_info=True)
         return {"attempted": 0, "changed": 0}
 
     profile = _extract_json_object(raw)
@@ -1532,7 +1554,6 @@ async def sync_user_document(
     sender_username: str | None,
     sender_first_name: str | None,
 ):
-    memories = await db.get_memories(chat_id, user_id)
     user_facts = await db.get_user_facts(chat_id, user_id, limit=FACT_KEEP_PER_USER)
     user_profile = await db.get_user_profile(chat_id, user_id)
     payload = build_user_document_payload(
@@ -1540,7 +1561,6 @@ async def sync_user_document(
         user_profile,
         sender_username,
         sender_first_name,
-        memories,
     )
     await db.upsert_user_document(
         chat_id,
@@ -1556,16 +1576,13 @@ async def should_ask_intro(db, chat_id: int, user_id: int, input_text: str) -> b
         return False
 
     profile = await db.get_user_profile(chat_id, user_id)
-    memories = await db.get_memories(chat_id, user_id)
-    memory_map = _memory_map(memories)
 
     has_display_name = bool(
         (profile.get("approved_display_name") or profile.get("display_name") or "").strip()
     )
     has_nickname = bool((profile.get("nickname") or "").strip())
-    has_memory_name = any(memory_map.get(key) for key in ("preferred_name", "name", "nickname"))
 
-    if has_display_name or has_nickname or has_memory_name:
+    if has_display_name or has_nickname:
         return False
 
     user_document = await db.get_user_document(chat_id, user_id)
@@ -1595,7 +1612,6 @@ async def build_context(
 ) -> tuple[list[dict[str, str]], list[dict], dict[str, int]]:
     summary = await db.get_summary(chat_id)
     speaker_summary = await db.get_summary(chat_id, user_id)
-    memories = await db.get_memories(chat_id, user_id)
     user_facts = await db.get_user_facts(chat_id, user_id, limit=FACT_KEEP_PER_USER)
     user_profile = await db.get_user_profile(chat_id, user_id)
     user_document = await db.get_user_document(chat_id, user_id)
@@ -1654,7 +1670,9 @@ async def build_context(
                 "label": "reply_context",
             }
         )
-    clipped_speaker_summary = _clip_text(speaker_summary, min(220, plan.summary_chars))
+    speaker_summary_budget = max(plan.summary_chars * 3 // 5, 200)
+    general_summary_budget = max(plan.summary_chars - speaker_summary_budget, 120)
+    clipped_speaker_summary = _clip_text(speaker_summary, speaker_summary_budget)
     if clipped_speaker_summary:
         system_blocks.append(
             {
@@ -1668,7 +1686,7 @@ async def build_context(
             }
         )
 
-    clipped_summary = _clip_text(summary, plan.summary_chars)
+    clipped_summary = _clip_text(summary, general_summary_budget)
     if clipped_summary:
         system_blocks.append(
             {
@@ -1682,7 +1700,7 @@ async def build_context(
             }
         )
 
-    identity_block = build_identity_block(memories, user_profile, sender_username, sender_first_name)
+    identity_block = build_identity_block(user_profile, sender_username, sender_first_name)
     if identity_block:
         system_blocks.append({"content": identity_block, "bucket": "system", "label": "identity"})
 
@@ -1943,7 +1961,7 @@ async def _generate_answer_with_fallback(
             return answer, system_prompt, filtered, False
         except ContextOverflowError as e:
             last_overflow = e
-            print(f"[AGENT] context overflow on plan={plan.name}, retrying")
+            log.warning("context overflow on plan=%s, retrying", plan.name)
 
     fallback_input = _fit_text(input_text, 420) if not mention_only else ""
     fallback_messages = [{"role": "user", "content": fallback_input}]
@@ -2008,6 +2026,7 @@ async def edit_answer(
             turn_metrics=turn_metrics,
         )
     except Exception:
+        log.debug("edit_answer LLM call failed, using deterministic fallback", exc_info=True)
         return _deterministic_postprocess_answer(draft)
 
     return _editor_safe_output(draft, edited)
@@ -2043,6 +2062,7 @@ async def generate_simple_reply_fallback(
             turn_metrics=turn_metrics,
         )
     except Exception:
+        log.debug("simple reply fallback LLM call failed", exc_info=True)
         return ""
 
     return _shrink_reply_text(answer, limit=180)
@@ -2219,6 +2239,7 @@ async def run_agent(
                 )
             ).strip()
         except Exception:
+            log.debug("intro generation LLM call failed", exc_info=True)
             intro_line = ""
 
         answer = (answer or "").strip()

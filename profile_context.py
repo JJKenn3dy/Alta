@@ -1,6 +1,9 @@
 import json
+import logging
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger("alta.profile")
 
 
 def load_profile(path: str) -> dict[str, Any]:
@@ -12,6 +15,7 @@ def load_profile(path: str) -> dict[str, Any]:
         data = json.loads(raw)
         return data if isinstance(data, dict) else {}
     except Exception:
+        log.warning("failed to load profile from %s", path, exc_info=True)
         return {}
 
 
