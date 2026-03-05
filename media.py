@@ -1,10 +1,13 @@
 import json
+import logging
 import random
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
 from aiogram.enums import ParseMode
+
+log = logging.getLogger("alta.media")
 
 MEDIA_PACK_SET_NAMES = [
     "kockrlandemojipack",
@@ -76,6 +79,7 @@ def load_media_catalog(path: str) -> dict[str, Any]:
         data = json.loads(p.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except Exception:
+        log.warning("failed to load media catalog from %s", path, exc_info=True)
         return {}
 
 
@@ -92,6 +96,7 @@ async def build_media_catalog(bot, set_names: list[str] | None = None) -> dict[s
         try:
             sticker_set = await bot.get_sticker_set(name)
         except Exception:
+            log.warning("failed to fetch sticker set %r", name, exc_info=True)
             failed_sets.append(name)
             continue
 
@@ -166,6 +171,7 @@ async def choose_media_intent(
             turn_metrics=turn_metrics,
         )
     except Exception:
+        log.debug("media intent LLM call failed", exc_info=True)
         return {"send": False, "mode": "any", "emoji": "", "intensity": 0.0}
 
     data = _extract_json_object(raw)
@@ -200,6 +206,7 @@ async def choose_emoji_reply_intent(
             turn_metrics=turn_metrics,
         )
     except Exception:
+        log.debug("emoji reply intent LLM call failed", exc_info=True)
         return {"send": False, "mode": "any", "emoji": "", "intensity": 0.0}
 
     data = _extract_json_object(raw)
@@ -246,6 +253,7 @@ async def send_media_item(bot, chat_id: int, reply_to_message_id: int, item: dic
             await bot.send_sticker(chat_id, item["file_id"], reply_to_message_id=reply_to_message_id)
             return True
         except Exception:
+            log.debug("failed to send sticker file_id=%s", item.get("file_id"), exc_info=True)
             return False
 
     if kind == "custom_emoji":
@@ -261,12 +269,13 @@ async def send_media_item(bot, chat_id: int, reply_to_message_id: int, item: dic
                 )
                 return True
             except Exception:
-                pass
+                log.debug("failed to send custom_emoji id=%s, falling back to sticker", custom_emoji_id, exc_info=True)
         if item.get("file_id"):
             try:
                 await bot.send_sticker(chat_id, item["file_id"], reply_to_message_id=reply_to_message_id)
                 return True
             except Exception:
+                log.debug("failed to send fallback sticker file_id=%s", item.get("file_id"), exc_info=True)
                 return False
 
     return False

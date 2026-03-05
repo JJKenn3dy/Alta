@@ -1,5 +1,10 @@
+import logging
+from contextlib import asynccontextmanager
+
 import aiosqlite
 from typing import Optional
+
+log = logging.getLogger("alta.db")
 
 INVALID_IDENTITY_VALUES = (
     "ты",
@@ -186,6 +191,18 @@ class DB:
     def __init__(self, path: str):
         self.path = path
         self.conn: Optional[aiosqlite.Connection] = None
+
+    @asynccontextmanager
+    async def _transaction(self):
+        """Explicit transaction: BEGIN … COMMIT, with ROLLBACK on error."""
+        assert self.conn
+        await self.conn.execute("BEGIN")
+        try:
+            yield
+            await self.conn.commit()
+        except BaseException:
+            await self.conn.rollback()
+            raise
 
     async def connect(self):
         self.conn = await aiosqlite.connect(self.path)
@@ -891,46 +908,46 @@ class DB:
         chunks: list[dict[str, str | int]],
     ):
         assert self.conn
-        await self.conn.execute(
-            "INSERT INTO context_files(path,mtime,size) VALUES(?,?,?) "
-            "ON CONFLICT(path) DO UPDATE SET "
-            "mtime=excluded.mtime,size=excluded.size,updated_at=datetime('now')",
-            (path, mtime, size),
-        )
-        cur = await self.conn.execute("SELECT id FROM context_files WHERE path=?", (path,))
-        row = await cur.fetchone()
-        if not row:
-            raise RuntimeError(f"context file row missing after upsert: {path}")
-
-        file_id = int(row["id"])
-        await self.conn.execute("DELETE FROM context_chunks WHERE file_id=?", (file_id,))
-        if chunks:
-            await self.conn.executemany(
-                "INSERT INTO context_chunks(file_id,chunk_index,content,normalized_text) "
-                "VALUES(?,?,?,?)",
-                [
-                    (
-                        file_id,
-                        int(chunk["chunk_index"]),
-                        str(chunk["content"]),
-                        str(chunk["normalized_text"]),
-                    )
-                    for chunk in chunks
-                ],
+        async with self._transaction():
+            await self.conn.execute(
+                "INSERT INTO context_files(path,mtime,size) VALUES(?,?,?) "
+                "ON CONFLICT(path) DO UPDATE SET "
+                "mtime=excluded.mtime,size=excluded.size,updated_at=datetime('now')",
+                (path, mtime, size),
             )
-        await self.conn.commit()
+            cur = await self.conn.execute("SELECT id FROM context_files WHERE path=?", (path,))
+            row = await cur.fetchone()
+            if not row:
+                raise RuntimeError(f"context file row missing after upsert: {path}")
+
+            file_id = int(row["id"])
+            await self.conn.execute("DELETE FROM context_chunks WHERE file_id=?", (file_id,))
+            if chunks:
+                await self.conn.executemany(
+                    "INSERT INTO context_chunks(file_id,chunk_index,content,normalized_text) "
+                    "VALUES(?,?,?,?)",
+                    [
+                        (
+                            file_id,
+                            int(chunk["chunk_index"]),
+                            str(chunk["content"]),
+                            str(chunk["normalized_text"]),
+                        )
+                        for chunk in chunks
+                    ],
+                )
 
     async def delete_context_file(self, path: str):
         assert self.conn
-        cur = await self.conn.execute("SELECT id FROM context_files WHERE path=?", (path,))
-        row = await cur.fetchone()
-        if not row:
-            return
+        async with self._transaction():
+            cur = await self.conn.execute("SELECT id FROM context_files WHERE path=?", (path,))
+            row = await cur.fetchone()
+            if not row:
+                return
 
-        file_id = int(row["id"])
-        await self.conn.execute("DELETE FROM context_chunks WHERE file_id=?", (file_id,))
-        await self.conn.execute("DELETE FROM context_files WHERE id=?", (file_id,))
-        await self.conn.commit()
+            file_id = int(row["id"])
+            await self.conn.execute("DELETE FROM context_chunks WHERE file_id=?", (file_id,))
+            await self.conn.execute("DELETE FROM context_files WHERE id=?", (file_id,))
 
     async def get_context_chunks(self, limit: int | None = None) -> list[dict]:
         assert self.conn

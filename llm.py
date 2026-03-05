@@ -1,10 +1,13 @@
 import asyncio
+import logging
 import math
 import time
 
 from openai import AsyncOpenAI
 from openai import APIConnectionError, APIStatusError, APITimeoutError, BadRequestError, RateLimitError
 from telemetry import LLMCallMetrics, approx_text_tokens
+
+log = logging.getLogger("alta.llm")
 
 
 class ContextOverflowError(RuntimeError):
@@ -162,9 +165,7 @@ class LLM:
             except (APIConnectionError, APITimeoutError, RateLimitError) as e:
                 last_err = e
                 delay = self.base_delay * attempt
-                print(
-                    f"[LLM] attempt {attempt}/{self.max_retries} failed: {type(e).__name__}, retry in {delay:.1f}s"
-                )
+                log.warning("attempt %d/%d failed: %s, retry in %.1fs", attempt, self.max_retries, type(e).__name__, delay)
                 await asyncio.sleep(delay)
 
             except (BadRequestError, APIStatusError) as e:
@@ -172,12 +173,12 @@ class LLM:
                     _record_failure(e)
                     raise ContextOverflowError(str(e)) from e
                 _record_failure(e)
-                print(f"[LLM] fatal api error: {e}")
+                log.error("fatal api error: %s", e)
                 raise
 
             except Exception as e:
                 _record_failure(e)
-                print(f"[LLM] fatal error: {e}")
+                log.error("fatal error: %s", e)
                 raise
 
         if last_err is not None:

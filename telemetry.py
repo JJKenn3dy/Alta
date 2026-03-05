@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 import threading
 import time
@@ -6,6 +7,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger("alta.telemetry")
 
 
 CHARS_PER_TOKEN_HEURISTIC = 4.0
@@ -49,7 +52,7 @@ class JSONLLogger:
                 fh.write(line + "\n")
 
         if self.debug_enabled:
-            print(f"[METRICS] {event.get('event')} turn={event.get('turn_id')}")
+            log.debug("metrics: %s turn=%s", event.get("event"), event.get("turn_id"))
 
 
 @dataclass

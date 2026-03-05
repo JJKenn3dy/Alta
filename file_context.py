@@ -1,6 +1,10 @@
+import asyncio
+import logging
 import re
 import time
 from pathlib import Path
+
+log = logging.getLogger("alta.file_context")
 
 SYNC_INTERVAL_SEC = 15.0
 MAX_TEXT_BYTES_DEFAULT = 262_144
@@ -102,10 +106,12 @@ def _query_tokens(text: str) -> list[str]:
 
 
 def _read_text(path: Path, max_bytes: int) -> str:
-    if path.stat().st_size > max_bytes:
+    try:
+        raw = path.read_bytes()
+    except OSError:
         return ""
-
-    raw = path.read_bytes()
+    if len(raw) > max_bytes:
+        return ""
     for encoding in ("utf-8", "utf-8-sig", "cp1251", "latin-1"):
         try:
             return raw.decode(encoding)
@@ -163,6 +169,40 @@ def chunk_text(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE, overlap: int = D
     return chunks
 
 
+def _scan_and_read(
+    root: Path,
+    max_files: int,
+    max_file_bytes: int,
+) -> list[tuple[str, float, int, str]]:
+    """Blocking I/O: scan directory & read files. Returns list of (rel_path, mtime, size, text)."""
+    root.mkdir(parents=True, exist_ok=True)
+    candidates = []
+    try:
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            if any(part.startswith(".") for part in path.parts):
+                continue
+            if path.suffix.lower() not in TEXT_FILE_EXTENSIONS:
+                continue
+            candidates.append(path)
+    except OSError:
+        log.warning("failed to scan knowledge dir %s", root, exc_info=True)
+        return []
+
+    candidates.sort()
+    results: list[tuple[str, float, int, str]] = []
+    for path in candidates[:max_files]:
+        rel_path = path.relative_to(root).as_posix()
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        text = _read_text(path, max_file_bytes)
+        results.append((rel_path, float(stat.st_mtime), int(stat.st_size), text))
+    return results
+
+
 async def sync_context_dir(
     db,
     knowledge_dir: str,
@@ -171,7 +211,6 @@ async def sync_context_dir(
     max_file_bytes: int,
 ):
     root = Path(knowledge_dir)
-    root.mkdir(parents=True, exist_ok=True)
     root_key = str(root.resolve()).lower()
     now = time.monotonic()
     last_sync = _LAST_SYNC_TS.get(root_key, 0.0)
@@ -182,34 +221,17 @@ async def sync_context_dir(
     existing = await db.list_context_files()
     seen_paths: set[str] = set()
 
-    candidates = []
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        if any(part.startswith(".") for part in path.parts):
-            continue
-        if path.suffix.lower() not in TEXT_FILE_EXTENSIONS:
-            continue
-        candidates.append(path)
+    file_entries = await asyncio.to_thread(_scan_and_read, root, max_files, max_file_bytes)
 
-    candidates.sort()
-
-    for path in candidates[:max_files]:
-        rel_path = path.relative_to(root).as_posix()
+    for rel_path, mtime, size, text in file_entries:
         seen_paths.add(rel_path)
-
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
 
         current = existing.get(rel_path)
         if current:
-            same_mtime = abs(float(current["mtime"]) - float(stat.st_mtime)) < 0.001
-            if same_mtime and int(current["size"]) == int(stat.st_size):
+            same_mtime = abs(float(current["mtime"]) - mtime) < 0.001
+            if same_mtime and int(current["size"]) == size:
                 continue
 
-        text = _read_text(path, max_file_bytes)
         if not text.strip():
             await db.delete_context_file(rel_path)
             continue
@@ -221,8 +243,8 @@ async def sync_context_dir(
 
         await db.replace_context_file(
             rel_path,
-            float(stat.st_mtime),
-            int(stat.st_size),
+            mtime,
+            size,
             [
                 {
                     "chunk_index": index,

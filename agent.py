@@ -1,7 +1,10 @@
 import json
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any
+
+log = logging.getLogger("alta.agent")
 
 from file_context import build_file_context_block, retrieve_context_snippets, sync_context_dir
 from llm import ContextOverflowError
@@ -1219,7 +1222,7 @@ async def maybe_update_summary(
             await db.set_summary(chat_id, normalized_summary)
             updated = True
     except Exception:
-        pass
+        log.warning("failed to update chat summary chat=%s", chat_id, exc_info=True)
 
     if should_update_user_summary:
         current_user_summary = await db.get_summary(chat_id, user_id)
@@ -1254,7 +1257,7 @@ async def maybe_update_summary(
                 await db.set_summary(chat_id, normalized_user_summary, user_id=user_id)
                 updated = True
         except Exception:
-            pass
+            log.warning("failed to update user summary chat=%s user=%s", chat_id, user_id, exc_info=True)
     return updated
 
 
@@ -1284,6 +1287,7 @@ async def maybe_store_memories(
             turn_metrics=turn_metrics,
         )
     except Exception:
+        log.debug("memory extraction LLM call failed", exc_info=True)
         return {"attempted": 0, "changed": 0}
 
     items = _extract_json_array(raw)[:MAX_FACT_ITEMS_PER_TURN]
@@ -1378,6 +1382,7 @@ async def maybe_store_user_profile(
             turn_metrics=turn_metrics,
         )
     except Exception:
+        log.debug("profile extraction LLM call failed", exc_info=True)
         return {"attempted": 0, "changed": 0}
 
     profile = _extract_json_object(raw)
@@ -1943,7 +1948,7 @@ async def _generate_answer_with_fallback(
             return answer, system_prompt, filtered, False
         except ContextOverflowError as e:
             last_overflow = e
-            print(f"[AGENT] context overflow on plan={plan.name}, retrying")
+            log.warning("context overflow on plan=%s, retrying", plan.name)
 
     fallback_input = _fit_text(input_text, 420) if not mention_only else ""
     fallback_messages = [{"role": "user", "content": fallback_input}]
@@ -2008,6 +2013,7 @@ async def edit_answer(
             turn_metrics=turn_metrics,
         )
     except Exception:
+        log.debug("edit_answer LLM call failed, using deterministic fallback", exc_info=True)
         return _deterministic_postprocess_answer(draft)
 
     return _editor_safe_output(draft, edited)
@@ -2043,6 +2049,7 @@ async def generate_simple_reply_fallback(
             turn_metrics=turn_metrics,
         )
     except Exception:
+        log.debug("simple reply fallback LLM call failed", exc_info=True)
         return ""
 
     return _shrink_reply_text(answer, limit=180)
@@ -2219,6 +2226,7 @@ async def run_agent(
                 )
             ).strip()
         except Exception:
+            log.debug("intro generation LLM call failed", exc_info=True)
             intro_line = ""
 
         answer = (answer or "").strip()

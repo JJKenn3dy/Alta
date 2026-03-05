@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import random
 import re
 import sys
@@ -6,6 +7,8 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
+
+log = logging.getLogger("alta")
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatType
@@ -33,10 +36,87 @@ BOT_ALIASES = [
     "\u0430\u043b\u044c\u0442\u0435\u043d\u044c\u043a\u0430",
 ]
 
-_last_call: dict[tuple[int, int], float] = {}
-_last_reaction_ack: dict[tuple[int, int], float] = {}
-_last_verification_hint: dict[tuple[int, int], float] = {}
-_chat_turn_locks: dict[int, asyncio.Lock] = {}
+class CooldownManager:
+    """Tracks per-key timestamps with automatic eviction of stale entries."""
+
+    def __init__(self, max_size: int = 5000, evict_after: float = 3600.0):
+        self._data: dict[tuple[int, int], float] = {}
+        self._max_size = max_size
+        self._evict_after = evict_after
+
+    def check(self, key: tuple[int, int], cooldown_sec: float) -> bool:
+        """Return True if cooldown has passed (action allowed). Records timestamp on success."""
+        now = time.time()
+        last = self._data.get(key, 0.0)
+        if now - last < cooldown_sec:
+            return False
+        self._data[key] = now
+        self._maybe_evict(now)
+        return True
+
+    def record(self, key: tuple[int, int]) -> None:
+        """Record a timestamp without cooldown check."""
+        now = time.time()
+        self._data[key] = now
+        self._maybe_evict(now)
+
+    def get_last(self, key: tuple[int, int]) -> float:
+        return self._data.get(key, 0.0)
+
+    def pop(self, key: tuple[int, int]) -> None:
+        self._data.pop(key, None)
+
+    def _maybe_evict(self, now: float) -> None:
+        if len(self._data) <= self._max_size:
+            return
+        cutoff = now - self._evict_after
+        stale = [k for k, ts in self._data.items() if ts < cutoff]
+        for k in stale:
+            del self._data[k]
+        # If still over limit after TTL eviction, drop oldest entries
+        if len(self._data) > self._max_size:
+            by_age = sorted(self._data.items(), key=lambda kv: kv[1])
+            to_drop = len(self._data) - self._max_size
+            for k, _ in by_age[:to_drop]:
+                del self._data[k]
+
+
+class LockRegistry:
+    """Manages per-key asyncio.Lock instances with bounded size."""
+
+    def __init__(self, max_size: int = 2000):
+        self._locks: dict[int, tuple[asyncio.Lock, float]] = {}
+        self._max_size = max_size
+
+    def get(self, key: int) -> asyncio.Lock:
+        entry = self._locks.get(key)
+        now = time.time()
+        if entry is not None:
+            lock, _ = entry
+            self._locks[key] = (lock, now)
+            return lock
+        lock = asyncio.Lock()
+        self._locks[key] = (lock, now)
+        self._maybe_evict()
+        return lock
+
+    def _maybe_evict(self) -> None:
+        if len(self._locks) <= self._max_size:
+            return
+        # Only evict unlocked locks, oldest first
+        candidates = [
+            (k, ts) for k, (lock, ts) in self._locks.items() if not lock.locked()
+        ]
+        candidates.sort(key=lambda kv: kv[1])
+        to_drop = len(self._locks) - self._max_size
+        for k, _ in candidates[:to_drop]:
+            del self._locks[k]
+
+
+_cooldown_calls = CooldownManager(max_size=5000, evict_after=3600.0)
+_cooldown_reaction = CooldownManager(max_size=5000, evict_after=3600.0)
+_cooldown_verification = CooldownManager(max_size=1000, evict_after=600.0)
+_chat_locks = LockRegistry(max_size=2000)
 WORD_BOUNDARY_CLASS = "0-9A-Za-z\u0410-\u042f\u0430-\u044f\u0401\u0451_"
 MEDIA_REPLY_COOLDOWN_KEY = "media_reply"
 
@@ -134,34 +214,17 @@ _pending_join_verification: dict[tuple[int, int], JoinVerification] = {}
 
 
 def get_chat_turn_lock(chat_id: int) -> asyncio.Lock:
-    lock = _chat_turn_locks.get(chat_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _chat_turn_locks[chat_id] = lock
-    return lock
+    return _chat_locks.get(chat_id)
 
 
 def cooldown_ok(chat_id: int, user_id: int, cooldown_sec: int) -> bool:
     if cooldown_sec <= 0:
         return True
-
-    now = time.time()
-    key = (chat_id, user_id)
-    last = _last_call.get(key, 0.0)
-    if now - last < cooldown_sec:
-        return False
-    _last_call[key] = now
-    return True
+    return _cooldown_calls.check((chat_id, user_id), cooldown_sec)
 
 
 def reaction_ack_cooldown_ok(chat_id: int, user_id: int, cooldown_sec: int = 180) -> bool:
-    now = time.time()
-    key = (chat_id, user_id)
-    last = _last_reaction_ack.get(key, 0.0)
-    if now - last < cooldown_sec:
-        return False
-    _last_reaction_ack[key] = now
-    return True
+    return _cooldown_reaction.check((chat_id, user_id), cooldown_sec)
 
 
 async def media_cooldown_ok(db: DB, chat_id: int, user_id: int, cooldown_sec: int) -> bool:
@@ -395,15 +458,15 @@ async def main():
     configure_stdio()
     cfg = load_config()
 
-    print("[BOOT] starting bot")
+    log.info("starting bot")
     bot = Bot(cfg.bot_token)
     await bot.delete_webhook(drop_pending_updates=True)
-    print("[BOOT] pending updates dropped")
+    log.info("pending updates dropped")
     dp = Dispatcher()
 
     db = DB(cfg.db_path)
     await db.connect()
-    print("[BOOT] db connected")
+    log.info("db connected")
 
     llm = LLM(
         cfg.llm_base_url,
@@ -417,22 +480,23 @@ async def main():
         debug_enabled=cfg.enable_debug_logs,
         log_path=cfg.orchestration_log_path,
     )
-    print("[BOOT] llm client ready")
+    log.info("llm client ready")
 
     media_catalog = await maybe_refresh_media_catalog(bot, cfg.media_catalog_path)
-    print(
-        f"[BOOT] media catalog items={len(media_catalog.get('items', []))} "
-        f"failed_sets={len(media_catalog.get('failed_sets', []))}"
+    log.info(
+        "media catalog items=%d failed_sets=%d",
+        len(media_catalog.get("items", [])),
+        len(media_catalog.get("failed_sets", [])),
     )
 
     me = await bot.get_me()
     bot_username = me.username or ""
     bot_id = me.id
-    print(f"[BOOT] bot = @{bot_username} ({bot_id})")
+    log.info("bot = @%s (%s)", bot_username, bot_id)
 
     for cid in cfg.allowed_chat_ids:
         await db.ensure_allowed_chat(cid, "env-allowlist")
-        print(f"[BOOT] allowed chat {cid}")
+        log.info("allowed chat %s", cid)
 
     async def schedule_join_timeout(chat_id: int, user_id: int, timeout_sec: int):
         await asyncio.sleep(timeout_sec)
@@ -442,7 +506,7 @@ async def main():
             return
 
         _pending_join_verification.pop(key, None)
-        _last_verification_hint.pop(key, None)
+        _cooldown_verification.pop(key)
 
         try:
             await bot.send_message(
@@ -450,12 +514,12 @@ async def main():
                 f"Проверка не пройдена вовремя. Удаляю пользователя {user_id} из чата.",
             )
         except Exception:
-            pass
+            log.warning("join-check: failed to send timeout notice chat=%s user=%s", chat_id, user_id, exc_info=True)
 
         try:
             await bot.delete_message(chat_id=chat_id, message_id=state.join_message_id)
         except Exception:
-            pass
+            log.debug("join-check: failed to delete join message chat=%s msg=%s", chat_id, state.join_message_id, exc_info=True)
 
         try:
             await bot.ban_chat_member(
@@ -465,9 +529,9 @@ async def main():
                 revoke_messages=False,
             )
             await bot.unban_chat_member(chat_id=chat_id, user_id=user_id, only_if_banned=True)
-            print(f"[JOIN-CHECK] kicked user={user_id} chat={chat_id} (timeout)")
-        except Exception as e:
-            print(f"[JOIN-CHECK] failed to kick user={user_id} chat={chat_id}: {e}")
+            log.info("join-check: kicked user=%s chat=%s (timeout)", user_id, chat_id)
+        except Exception:
+            log.warning("join-check: failed to kick user=%s chat=%s", user_id, chat_id, exc_info=True)
 
     @dp.message(F.new_chat_members)
     async def on_new_chat_members(message: Message):
@@ -488,7 +552,7 @@ async def main():
             key = (chat_id, m.id)
 
             old = _pending_join_verification.pop(key, None)
-            if old:
+            if old and not old.task.done():
                 old.task.cancel()
 
             timeout_sec = max(20, cfg.join_verification_timeout_sec)
@@ -506,29 +570,29 @@ async def main():
                 f"{timeout_sec} сек. Пример: \"{code}\".\n"
                 f"Если код не придет вовремя, тебя автоматически удалит из чата."
             )
-            print(f"[JOIN-CHECK] started user={m.id} chat={chat_id} code={code}")
+            log.info("join-check: started user=%s chat=%s", m.id, chat_id)
 
     @dp.message(F.text)
     async def on_message(message: Message):
-        print("\n[MSG] new message")
+        log.debug("new message")
         if message.chat.type == ChatType.PRIVATE:
-            print("[SKIP] private chat")
+            log.debug("skip: private chat")
             return
 
         chat_id = message.chat.id
         if not await db.is_allowed(chat_id):
-            print(f"[SKIP] chat {chat_id} not allowed")
+            log.debug("skip: chat %s not allowed", chat_id)
             return
 
         if not message.from_user:
-            print("[SKIP] no from_user")
+            log.debug("skip: no from_user")
             return
 
         user_id = message.from_user.id
         username = message.from_user.username
         first_name = message.from_user.first_name
         text = message.text or ""
-        print(f"[IN] chat={chat_id} user={user_id} text={text!r}")
+        log.debug("in: chat=%s user=%s text=%r", chat_id, user_id, text)
 
         await db.upsert_user(user_id, username)
 
@@ -539,7 +603,7 @@ async def main():
             if candidate == pending.code:
                 pending.task.cancel()
                 _pending_join_verification.pop(key, None)
-                _last_verification_hint.pop(key, None)
+                _cooldown_verification.pop(key)
                 await db.upsert_memory(
                     chat_id,
                     user_id,
@@ -550,12 +614,12 @@ async def main():
                     source="join_verification",
                 )
                 await message.reply("Ок, проверка пройдена, добро пожаловать.")
-                print(f"[JOIN-CHECK] passed user={user_id} chat={chat_id}")
+                log.info("join-check: passed user=%s chat=%s", user_id, chat_id)
             else:
                 now = time.time()
-                last_hint = _last_verification_hint.get(key, 0.0)
+                last_hint = _cooldown_verification.get_last(key)
                 if now - last_hint > 10:
-                    _last_verification_hint[key] = now
+                    _cooldown_verification.record(key)
                     remaining = max(1, int(pending.deadline_ts - now))
                     await message.reply(
                         f"Сначала пройди проверку: отправь код {pending.code}. "
@@ -576,45 +640,43 @@ async def main():
                 message.reply_to_message.message_id,
             )
             if pending_name:
-                if NAME_APPROVE_RE.match(approval_text):
-                    target_user = await db.get_user(int(pending_name["user_id"]))
+                pn_user_id = pending_name.get("user_id")
+                pn_name = pending_name.get("requested_name")
+                if pn_user_id is None or pn_name is None:
+                    log.warning("name-approval: incomplete record chat=%s msg=%s", chat_id, message.reply_to_message.message_id)
+                elif NAME_APPROVE_RE.match(approval_text):
+                    target_user = await db.get_user(int(pn_user_id))
                     await db.resolve_pending_name_approval(
                         chat_id,
-                        int(pending_name["user_id"]),
+                        int(pn_user_id),
                         status="approved",
-                        approved_display_name=str(pending_name["requested_name"]),
+                        approved_display_name=str(pn_name),
                     )
                     who = format_user_label(
-                        int(pending_name["user_id"]),
-                        target_user.get("username"),
+                        int(pn_user_id),
+                        target_user.get("username") if target_user else None,
                     )
                     await message.reply(
-                        f"Ок. Буду обращаться к {who} как «{pending_name['requested_name']}»."
+                        f"Ок. Буду обращаться к {who} как «{pn_name}»."
                     )
-                    print(
-                        f"[NAME-APPROVAL] approved user={pending_name['user_id']} "
-                        f"chat={chat_id} name={pending_name['requested_name']!r}"
-                    )
+                    log.info("name-approval: approved user=%s chat=%s name=%r", pn_user_id, chat_id, pn_name)
                     return
-                if NAME_REJECT_RE.match(approval_text):
+                elif NAME_REJECT_RE.match(approval_text):
                     await db.resolve_pending_name_approval(
                         chat_id,
-                        int(pending_name["user_id"]),
+                        int(pn_user_id),
                         status="rejected",
                     )
                     await message.reply("Ок, не меняю обращение.")
-                    print(
-                        f"[NAME-APPROVAL] rejected user={pending_name['user_id']} "
-                        f"chat={chat_id} name={pending_name['requested_name']!r}"
-                    )
+                    log.info("name-approval: rejected user=%s chat=%s name=%r", pn_user_id, chat_id, pn_name)
                     return
 
         if not is_trigger(message, bot_username, bot_id):
-            print("[SKIP] no trigger")
+            log.debug("skip: no trigger")
             return
 
         if not cooldown_ok(chat_id, user_id, cfg.user_cooldown_sec):
-            print("[SKIP] cooldown")
+            log.debug("skip: cooldown")
             return
 
         clean_text = sanitize_incoming_text(strip_mention(text, bot_username))
@@ -622,14 +684,14 @@ async def main():
         mention_only = False
         if not clean_text:
             mention_only = True
-        print(f"[CTX] clean_text={clean_text!r}")
+        log.debug("clean_text=%r", clean_text)
         reply_context = None
         if message.reply_to_message and message.reply_to_message.from_user:
             reply_source = message.reply_to_message
             reply_text = (
                 reply_source.text
                 or reply_source.caption
-                or (reply_source.sticker.emoji if reply_source.sticker else "")
+                or (reply_source.sticker.emoji if reply_source.sticker and reply_source.sticker.emoji else "")
                 or "[non-text message]"
             )
             reply_text = sanitize_incoming_text(reply_text)
@@ -667,7 +729,7 @@ async def main():
         try:
             async with get_chat_turn_lock(chat_id):
                 if is_emoji_only_message(text):
-                    print("[CTX] emoji-only message detected")
+                    log.debug("emoji-only message detected")
                     if media_catalog.get("items") and await media_cooldown_ok(
                         db,
                         chat_id,
@@ -692,10 +754,7 @@ async def main():
                                 marker,
                                 target_user_id=user_id,
                             )
-                            print(
-                                f"[EMOJI-REPLY] user={user_id} kind={item.get('kind')} "
-                                f"emoji={item.get('emoji')} set={item.get('set_name')}"
-                            )
+                            log.info("emoji-reply: user=%s kind=%s emoji=%s set=%s", user_id, item.get('kind'), item.get('emoji'), item.get('set_name'))
                             return
 
                 await db.add_message(chat_id, user_id, "user", clean_text)
@@ -715,10 +774,7 @@ async def main():
                         await message.reply(
                             f"Ок. Буду обращаться к тебе как «{requested_display_name}»."
                         )
-                        print(
-                            f"[NAME-APPROVAL] self-approved user={user_id} "
-                            f"chat={chat_id} name={requested_display_name!r}"
-                        )
+                        log.info("name-approval: self-approved user=%s chat=%s name=%r", user_id, chat_id, requested_display_name)
                         return
 
                     await db.create_pending_name_approval(
@@ -739,10 +795,7 @@ async def main():
                         user_id,
                         approval_prompt.message_id,
                     )
-                    print(
-                        f"[NAME-APPROVAL] requested user={user_id} "
-                        f"chat={chat_id} name={requested_display_name!r}"
-                    )
+                    log.info("name-approval: requested user=%s chat=%s name=%r", user_id, chat_id, requested_display_name)
                     return
                 await bot.send_chat_action(chat_id, "typing")
 
@@ -773,11 +826,11 @@ async def main():
                     )
                 except Exception as e:
                     turn_metrics.set_error(e)
-                    print(f"[ERROR] agent failed: {e}")
+                    log.error("agent failed: %s", e, exc_info=True)
                     return
 
                 if not answer:
-                    print("[WARN] empty answer")
+                    log.warning("empty answer for chat=%s user=%s", chat_id, user_id)
                     return
 
                 answer = convert_bracket_mentions_to_tg(answer)
@@ -785,7 +838,7 @@ async def main():
                 answer = strip_foreign_leading_mention(answer, username)
                 await message.reply(answer)
                 await db.add_message(chat_id, bot_id, "assistant", answer, target_user_id=user_id)
-                print(f"[OUT] {answer!r}")
+                log.debug("out: %r", answer)
 
                 if media_catalog.get("items") and await media_cooldown_ok(
                     db,
@@ -807,10 +860,7 @@ async def main():
                             sent = await send_media_item(bot, chat_id, message.message_id, item)
                             if sent:
                                 await mark_media_cooldown(db, chat_id, user_id)
-                                print(
-                                    f"[MEDIA] user={user_id} kind={item.get('kind')} "
-                                    f"emoji={item.get('emoji')} set={item.get('set_name')}"
-                                )
+                                log.info("media: user=%s kind=%s emoji=%s set=%s", user_id, item.get('kind'), item.get('emoji'), item.get('set_name'))
         finally:
             turn_metrics.finish()
 
@@ -865,6 +915,7 @@ async def main():
                 max_tokens=45,
             )
         except Exception:
+            log.debug("reaction-ack: LLM call failed", exc_info=True)
             return
 
         ack = sanitize_outgoing_text(convert_bracket_mentions_to_tg((ack or "").strip()))
@@ -873,9 +924,9 @@ async def main():
 
         await bot.send_message(chat_id, ack, reply_to_message_id=event.message_id)
         await db.add_message(chat_id, bot_id, "assistant", ack, target_user_id=user.id)
-        print(f"[REACTION] {who} -> {reaction_text} | ack={ack!r}")
+        log.info("reaction: %s -> %s | ack=%r", who, reaction_text, ack)
 
-    print("[BOOT] polling started")
+    log.info("polling started")
     try:
         await dp.start_polling(bot)
     finally:
@@ -884,11 +935,16 @@ async def main():
         _pending_join_verification.clear()
         await db.close()
         await bot.session.close()
-        print("[BOOT] shutdown")
+        log.info("shutdown")
 
 
 if __name__ == "__main__":
     configure_stdio()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     # Some Windows setups block Proactor self-pipe socket creation (WinError 10013).
     # Selector policy avoids that and is sufficient for this bot.
     if sys.platform.startswith("win"):
