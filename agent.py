@@ -1917,7 +1917,7 @@ async def _generate_answer_with_fallback(
     reply_context: ReplyContext | None = None,
     turn_id: str | None = None,
     turn_metrics=None,
-) -> tuple[str, str, list[dict], bool]:
+) -> tuple[str, str, list[dict], list[dict], bool]:
     last_overflow: Exception | None = None
 
     for plan in _build_context_plans(max_tokens, history_limit):
@@ -1958,7 +1958,7 @@ async def _generate_answer_with_fallback(
                 turn_id=turn_id,
                 turn_metrics=turn_metrics,
             )
-            return answer, system_prompt, filtered, False
+            return answer, system_prompt, filtered, system_blocks, False
         except ContextOverflowError as e:
             last_overflow = e
             log.warning("context overflow on plan=%s, retrying", plan.name)
@@ -1991,7 +1991,7 @@ async def _generate_answer_with_fallback(
                     "creator_profile_tokens": 0,
                 }
             )
-        return fallback_answer, ALTA_SYSTEM_PROMPT, fallback_messages, True
+        return fallback_answer, ALTA_SYSTEM_PROMPT, fallback_messages, [], True
     except ContextOverflowError as e:
         last_overflow = e
 
@@ -2166,7 +2166,7 @@ async def run_agent(
             turn_metrics.summary_write_count += 1
     ask_intro = await should_ask_intro(db, chat_id, user_id, input_text)
 
-    answer, system_prompt, filtered, fallback_used = await _generate_answer_with_fallback(
+    answer, system_prompt, filtered, system_blocks, fallback_used = await _generate_answer_with_fallback(
         llm,
         db,
         chat_id,
@@ -2281,7 +2281,17 @@ async def run_agent(
             (
                 chat_id,
                 input_text,
-                json.dumps({"system": system_prompt, "messages": filtered}, ensure_ascii=False),
+                json.dumps(
+                    {
+                        "system": system_prompt,
+                        "messages": filtered,
+                        "system_blocks": [
+                            {"label": b["label"], "bucket": b["bucket"], "content": b["content"]}
+                            for b in system_blocks
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
                 answer,
             ),
         )
