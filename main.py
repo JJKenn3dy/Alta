@@ -5,7 +5,6 @@ import re
 import sys
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 
 log = logging.getLogger("alta")
@@ -187,6 +186,10 @@ NAME_REQUEST_PATTERNS = (
 )
 NAME_APPROVE_RE = re.compile(r"^(?:/approve_name|/approve_nick|одобряю|approve)\b", re.IGNORECASE)
 NAME_REJECT_RE = re.compile(r"^(?:/deny_name|/deny_nick|не\s+одобряю|deny|reject)\b", re.IGNORECASE)
+UNBAN_COMMAND_RE = re.compile(
+    r"^/unban(?:@[A-Za-z][A-Za-z0-9_]{4,31})?(?:\s+(?P<target>\S+))?\s*$",
+    re.IGNORECASE,
+)
 INVALID_REQUESTED_NAMES = {
     "ты",
     "тебя",
@@ -215,6 +218,43 @@ _pending_join_verification: dict[tuple[int, int], JoinVerification] = {}
 
 def get_chat_turn_lock(chat_id: int) -> asyncio.Lock:
     return _chat_locks.get(chat_id)
+
+
+def _join_verification_ban_kwargs(chat_id: int, user_id: int) -> dict[str, object]:
+    return {
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "revoke_messages": True,
+    }
+
+
+def _chat_member_status(member) -> str:
+    raw = getattr(member, "status", "")
+    value = getattr(raw, "value", raw)
+    return str(value or "").lower()
+
+
+def _can_restrict_members(member) -> bool:
+    status = _chat_member_status(member)
+    if status in {"creator", "owner"}:
+        return True
+    return status == "administrator" and bool(getattr(member, "can_restrict_members", False))
+
+
+def _parse_unban_target_token(raw: str) -> tuple[int | None, str | None]:
+    token = str(raw or "").strip()
+    if not token:
+        return None, None
+    if token.startswith("@"):
+        token = token[1:]
+    if token.lstrip("-").isdigit():
+        try:
+            return int(token), None
+        except ValueError:
+            return None, None
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", token):
+        return None, token
+    return None, None
 
 
 def cooldown_ok(chat_id: int, user_id: int, cooldown_sec: int) -> bool:
@@ -498,6 +538,48 @@ async def main():
         await db.ensure_allowed_chat(cid, "env-allowlist")
         log.info("allowed chat %s", cid)
 
+    async def apply_join_verification_ban(
+        chat_id: int,
+        user_id: int,
+        *,
+        reason: str,
+        join_message_id: int | None = None,
+    ) -> bool:
+        key = (chat_id, user_id)
+        state = _pending_join_verification.pop(key, None)
+        _cooldown_verification.pop(key)
+        if state and not state.task.done():
+            state.task.cancel()
+
+        msg_id = join_message_id
+        if msg_id is None and state:
+            msg_id = state.join_message_id
+        if msg_id is not None:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            except Exception:
+                log.debug(
+                    "join-check: failed to delete join message chat=%s msg=%s reason=%s",
+                    chat_id,
+                    msg_id,
+                    reason,
+                    exc_info=True,
+                )
+
+        try:
+            await bot.ban_chat_member(**_join_verification_ban_kwargs(chat_id=chat_id, user_id=user_id))
+            log.info("join-check: banned user=%s chat=%s reason=%s", user_id, chat_id, reason)
+            return True
+        except Exception:
+            log.warning(
+                "join-check: failed to ban user=%s chat=%s reason=%s",
+                user_id,
+                chat_id,
+                reason,
+                exc_info=True,
+            )
+            return False
+
     async def schedule_join_timeout(chat_id: int, user_id: int, timeout_sec: int):
         await asyncio.sleep(timeout_sec)
         key = (chat_id, user_id)
@@ -505,33 +587,26 @@ async def main():
         if not state or time.time() < state.deadline_ts:
             return
 
-        _pending_join_verification.pop(key, None)
-        _cooldown_verification.pop(key)
-
         try:
             await bot.send_message(
                 chat_id,
-                f"Проверка не пройдена вовремя. Удаляю пользователя {user_id} из чата.",
+                f"Anti-bot check timeout for user {user_id}. Account is now banned. "
+                f"If this was a mistake: /unban {user_id}",
             )
         except Exception:
-            log.warning("join-check: failed to send timeout notice chat=%s user=%s", chat_id, user_id, exc_info=True)
-
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=state.join_message_id)
-        except Exception:
-            log.debug("join-check: failed to delete join message chat=%s msg=%s", chat_id, state.join_message_id, exc_info=True)
-
-        try:
-            await bot.ban_chat_member(
-                chat_id=chat_id,
-                user_id=user_id,
-                until_date=datetime.now(timezone.utc) + timedelta(minutes=1),
-                revoke_messages=False,
+            log.warning(
+                "join-check: failed to send timeout notice chat=%s user=%s",
+                chat_id,
+                user_id,
+                exc_info=True,
             )
-            await bot.unban_chat_member(chat_id=chat_id, user_id=user_id, only_if_banned=True)
-            log.info("join-check: kicked user=%s chat=%s (timeout)", user_id, chat_id)
-        except Exception:
-            log.warning("join-check: failed to kick user=%s chat=%s", user_id, chat_id, exc_info=True)
+
+        await apply_join_verification_ban(
+            chat_id=chat_id,
+            user_id=user_id,
+            reason="timeout",
+            join_message_id=state.join_message_id,
+        )
 
     @dp.message(F.new_chat_members)
     async def on_new_chat_members(message: Message):
@@ -544,10 +619,32 @@ async def main():
 
         members = message.new_chat_members or []
         for m in members:
-            if m.id == bot_id or m.is_bot:
+            if m.id == bot_id:
                 continue
 
             await db.upsert_user(m.id, m.username)
+            if m.is_bot:
+                banned = await apply_join_verification_ban(
+                    chat_id=chat_id,
+                    user_id=m.id,
+                    reason="joined-bot-account",
+                    join_message_id=message.message_id,
+                )
+                if banned:
+                    try:
+                        await message.reply(
+                            f"Bot account {m.id} was banned by anti-bot gate. "
+                            f"If this is a mistake: /unban {m.id}"
+                        )
+                    except Exception:
+                        log.debug(
+                            "join-check: failed to send bot-ban notice chat=%s user=%s",
+                            chat_id,
+                            m.id,
+                            exc_info=True,
+                        )
+                continue
+
             code = _make_join_code()
             key = (chat_id, m.id)
 
@@ -564,11 +661,10 @@ async def main():
                 join_message_id=message.message_id,
             )
 
-            who = f"@{m.username}" if m.username else (m.first_name or "новый участник")
+            who = f"@{m.username}" if m.username else (m.first_name or "new user")
             await message.reply(
-                f"{who}, привет. Антибот-проверка: отправь в чат код {code} в течение "
-                f"{timeout_sec} сек. Пример: \"{code}\".\n"
-                f"Если код не придет вовремя, тебя автоматически удалит из чата."
+                f"{who}, anti-bot check: send code {code} within {timeout_sec} sec.\n"
+                f"If check fails, account will be banned. Admin recovery: /unban {m.id}."
             )
             log.info("join-check: started user=%s chat=%s", m.id, chat_id)
 
@@ -595,6 +691,63 @@ async def main():
         log.debug("in: chat=%s user=%s text=%r", chat_id, user_id, text)
 
         await db.upsert_user(user_id, username)
+
+        unban_match = UNBAN_COMMAND_RE.match(text.strip())
+        if unban_match:
+            can_unban = cfg.creator_user_id is not None and user_id == cfg.creator_user_id
+            if not can_unban:
+                try:
+                    actor_member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+                    can_unban = _can_restrict_members(actor_member)
+                except Exception:
+                    log.warning(
+                        "unban: failed to inspect actor permissions chat=%s user=%s",
+                        chat_id,
+                        user_id,
+                        exc_info=True,
+                    )
+                    can_unban = False
+            if not can_unban:
+                await message.reply("Only chat admins with ban rights can use /unban.")
+                return
+
+            target_id: int | None = None
+            target_token = unban_match.group("target")
+            if target_token:
+                parsed_id, parsed_username = _parse_unban_target_token(target_token)
+                if parsed_id is not None:
+                    target_id = parsed_id
+                elif parsed_username is not None:
+                    known_user = await db.get_user_by_username(parsed_username)
+                    if known_user:
+                        target_id = int(known_user["user_id"])
+            elif message.reply_to_message and message.reply_to_message.from_user:
+                target_id = message.reply_to_message.from_user.id
+
+            if target_id is None:
+                await message.reply(
+                    "Usage: /unban <user_id|@username> or reply to a user with /unban."
+                )
+                return
+
+            try:
+                await bot.unban_chat_member(chat_id=chat_id, user_id=target_id, only_if_banned=False)
+            except Exception:
+                log.warning(
+                    "unban: failed chat=%s actor=%s target=%s",
+                    chat_id,
+                    user_id,
+                    target_id,
+                    exc_info=True,
+                )
+                await message.reply(f"Failed to unban user {target_id}. Check bot permissions.")
+                return
+
+            _pending_join_verification.pop((chat_id, target_id), None)
+            _cooldown_verification.pop((chat_id, target_id))
+            await message.reply(f"User {target_id} was unbanned.")
+            log.info("unban: actor=%s target=%s chat=%s", user_id, target_id, chat_id)
+            return
 
         key = (chat_id, user_id)
         pending = _pending_join_verification.get(key)
@@ -877,10 +1030,42 @@ async def main():
         if user.id == bot_id:
             return
 
+        if getattr(user, "is_bot", False):
+            await apply_join_verification_ban(
+                chat_id=chat_id,
+                user_id=user.id,
+                reason="bot-reaction",
+            )
+            return
+
         new_tokens = {reaction_to_token(r) for r in (event.new_reaction or [])}
         old_tokens = {reaction_to_token(r) for r in (event.old_reaction or [])}
         added = sorted(new_tokens - old_tokens)
         if not added:
+            return
+
+        pending = _pending_join_verification.get((chat_id, user.id))
+        if pending:
+            banned = await apply_join_verification_ban(
+                chat_id=chat_id,
+                user_id=user.id,
+                reason="reaction-before-verification",
+                join_message_id=pending.join_message_id,
+            )
+            if banned:
+                try:
+                    await bot.send_message(
+                        chat_id,
+                        f"User {user.id} reacted before passing anti-bot check and was banned. "
+                        f"If mistake: /unban {user.id}",
+                    )
+                except Exception:
+                    log.debug(
+                        "join-check: failed to send reaction-ban notice chat=%s user=%s",
+                        chat_id,
+                        user.id,
+                        exc_info=True,
+                    )
             return
 
         if not reaction_ack_cooldown_ok(chat_id, user.id):

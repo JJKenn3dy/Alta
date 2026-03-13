@@ -43,6 +43,8 @@ COMPACT_FILE_CONTEXT_CHARS = 1_000
 MINIMAL_FILE_CONTEXT_CHARS = 500
 USER_DOCUMENT_CHAR_LIMIT = 900
 USER_DOCUMENT_FACT_LIMIT = 20
+PARTICIPANTS_SUMMARY_CHAR_LIMIT = 120
+MAX_CHAT_PARTICIPANTS = 8
 
 FACT_TYPE_LABELS = {
     "interest": "Интерес",
@@ -91,6 +93,7 @@ class ContextPlan:
     file_chars: int
     max_tokens: int
     include_creator_profile: bool
+    include_participants: bool = True
 
 
 @dataclass(frozen=True)
@@ -307,6 +310,7 @@ def _build_context_plans(max_tokens: int, history_limit: int) -> list[ContextPla
             file_chars=MINIMAL_FILE_CONTEXT_CHARS,
             max_tokens=min(safe_max_tokens, 96),
             include_creator_profile=True,
+            include_participants=False,
         ),
         ContextPlan(
             name="emergency",
@@ -318,6 +322,7 @@ def _build_context_plans(max_tokens: int, history_limit: int) -> list[ContextPla
             file_chars=0,
             max_tokens=min(safe_max_tokens, 64),
             include_creator_profile=False,
+            include_participants=False,
         ),
     ]
 
@@ -1078,6 +1083,59 @@ def build_current_speaker_block(
     return "\n".join(lines)
 
 
+def build_chat_participants_block(
+    participants: list[dict],
+    current_user_id: int,
+) -> str:
+    """Build a system block listing other active chat participants.
+
+    Gives the LLM awareness that the chat has multiple people and what
+    topics were discussed with each, without leaking full profiles.
+    """
+    others = [p for p in participants if p.get("user_id") != current_user_id]
+    if not others:
+        return ""
+
+    lines = [
+        "Другие участники этого чата (ты общалась с ними ранее):"
+    ]
+    for p in others:
+        # Build a compact identifier: prefer display_name, fallback to @username
+        name_parts = []
+        display = (p.get("display_name") or "").strip()
+        username = (p.get("username") or "").strip()
+        if display:
+            name_parts.append(display)
+        if username:
+            name_parts.append(f"@{username}")
+        identifier = " / ".join(name_parts) if name_parts else f"id={p['user_id']}"
+
+        detail_parts = []
+        gender = (p.get("gender") or "").strip()
+        if gender:
+            detail_parts.append(f"пол: {gender}")
+        interests = (p.get("interests") or "").strip()
+        if interests:
+            detail_parts.append(f"интересы: {_clip_text(interests, 80)}")
+        summary = (p.get("summary") or "").strip()
+        if summary:
+            detail_parts.append(
+                f"темы: {_clip_text(summary, PARTICIPANTS_SUMMARY_CHAR_LIMIT)}"
+            )
+
+        detail = "; ".join(detail_parts)
+        if detail:
+            lines.append(f"- {identifier} ({detail})")
+        else:
+            lines.append(f"- {identifier}")
+
+    lines.append(
+        "Если спрашивают, с кем ты общалась — можешь упомянуть этих людей и темы. "
+        "Не путай их факты с фактами текущего собеседника."
+    )
+    return "\n".join(lines)
+
+
 def _extract_json_array(raw: str) -> list[dict[str, Any]]:
     text = (raw or "").strip()
     if not text:
@@ -1615,6 +1673,13 @@ async def build_context(
     user_facts = await db.get_user_facts(chat_id, user_id, limit=FACT_KEEP_PER_USER)
     user_profile = await db.get_user_profile(chat_id, user_id)
     user_document = await db.get_user_document(chat_id, user_id)
+    chat_participants = (
+        await db.get_chat_participants(
+            chat_id, exclude_user_id=user_id, limit=MAX_CHAT_PARTICIPANTS,
+        )
+        if plan.include_participants
+        else []
+    )
     focused_history = await db.get_last_messages(
         chat_id,
         min(history_limit, max(plan.history_messages * 2, 12)),
@@ -1704,6 +1769,15 @@ async def build_context(
     if identity_block:
         system_blocks.append({"content": identity_block, "bucket": "system", "label": "identity"})
 
+    if plan.include_participants:
+        participants_block = build_chat_participants_block(chat_participants, user_id)
+        if participants_block:
+            system_blocks.append({
+                "content": participants_block,
+                "bucket": "system",
+                "label": "participants",
+            })
+
     mem_text = format_user_facts(user_facts, max_lines=plan.memory_lines)
     if mem_text:
         system_blocks.append(
@@ -1767,6 +1841,9 @@ async def build_context(
         "reply_context_tokens": sum(
             approx_text_tokens(item["content"]) for item in system_blocks if item.get("label") == "reply_context"
         ),
+        "participants_tokens": sum(
+            approx_text_tokens(item["content"]) for item in system_blocks if item.get("label") == "participants"
+        ),
     }
 
     return [item for item in system_blocks if item.get("content")], prompt_history, context_metrics
@@ -1816,6 +1893,7 @@ def _measure_context_snapshot(
     user_document_tokens = 0
     current_speaker_tokens = 0
     reply_context_tokens = 0
+    participants_tokens = 0
 
     for block in system_blocks:
         text = str((block or {}).get("content") or "")
@@ -1841,7 +1919,9 @@ def _measure_context_snapshot(
             reply_context_tokens += tokens
         if label == "user_document":
             user_document_tokens += tokens
-        if label in {"identity", "current_speaker", "reply_context", "user_document"}:
+        if label == "participants":
+            participants_tokens += tokens
+        if label in {"identity", "current_speaker", "reply_context", "user_document", "participants"}:
             continue
         if "РљСЂР°С‚РєРѕРµ СЂРµР·СЋРјРµ" in text:
             summary_tokens += tokens
@@ -1875,6 +1955,7 @@ def _measure_context_snapshot(
         "user_document_tokens": user_document_tokens,
         "current_speaker_tokens": current_speaker_tokens,
         "reply_context_tokens": reply_context_tokens,
+        "participants_tokens": participants_tokens,
         "creator_profile_tokens": 0,
     }
 
@@ -2276,22 +2357,85 @@ async def run_agent(
             turn_metrics.fallback_used = True
 
     if debug_traces and hasattr(db, "conn") and db.conn:
+        reply_context_payload = None
+        if reply_context is not None:
+            reply_context_payload = {
+                "user_id": reply_context.user_id,
+                "username": reply_context.username,
+                "first_name": reply_context.first_name,
+                "text": reply_context.text,
+            }
+
+        llm_calls_payload: list[dict[str, Any]] = []
+        metrics_payload: dict[str, Any] = {}
+        if turn_metrics is not None:
+            llm_calls_payload = [dict(vars(call)) for call in getattr(turn_metrics, "llm_calls", [])]
+            metrics_payload = {
+                "history_tokens": turn_metrics.history_tokens,
+                "summary_tokens": turn_metrics.summary_tokens,
+                "memory_tokens": turn_metrics.memory_tokens,
+                "rag_tokens": turn_metrics.rag_tokens,
+                "system_tokens": turn_metrics.system_tokens,
+                "input_tokens": turn_metrics.input_tokens,
+                "identity_tokens": turn_metrics.identity_tokens,
+                "user_document_tokens": turn_metrics.user_document_tokens,
+                "creator_profile_tokens": turn_metrics.creator_profile_tokens,
+                "current_speaker_tokens": turn_metrics.current_speaker_tokens,
+                "reply_context_tokens": turn_metrics.reply_context_tokens,
+                "total_llm_calls": turn_metrics.total_llm_calls,
+                "total_tokens": turn_metrics.total_tokens,
+                "total_latency_ms": turn_metrics.total_latency_ms,
+                "fallback_used": turn_metrics.fallback_used,
+                "editor_attempted": turn_metrics.editor_attempted,
+                "editor_trigger": turn_metrics.editor_trigger,
+                "editor_changed_output": turn_metrics.editor_changed_output,
+                "summary_updated": turn_metrics.summary_updated,
+                "memory_updated": turn_metrics.memory_updated,
+                "profile_updated": turn_metrics.profile_updated,
+                "llm_calls": llm_calls_payload,
+            }
+
+        trace_payload = {
+            "turn_id": turn_id,
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "mode": mode,
+            "route_reason": routed_reason,
+            "has_attachments": bool(has_attachments),
+            "mention_only": bool(mention_only),
+            "reply_context": reply_context_payload,
+            "generation": {
+                "model": getattr(llm, "model", None),
+                "temperature": float(temperature),
+                "top_p": float(top_p),
+                "max_tokens": int(max_tokens),
+                "history_limit": int(history_limit),
+            },
+            "context": {
+                "system": system_prompt,
+                "messages": filtered,
+                "system_blocks": [
+                    {
+                        "label": (block or {}).get("label"),
+                        "bucket": (block or {}).get("bucket"),
+                        "content": (block or {}).get("content"),
+                    }
+                    for block in system_blocks
+                ],
+            },
+            "result": {
+                "answer": answer,
+                "fallback_used": bool(fallback_used),
+            },
+            "metrics": metrics_payload,
+        }
+
         await db.conn.execute(
             "INSERT INTO debug_traces(chat_id,input_text,context_json,output_text) VALUES(?,?,?,?)",
             (
                 chat_id,
                 input_text,
-                json.dumps(
-                    {
-                        "system": system_prompt,
-                        "messages": filtered,
-                        "system_blocks": [
-                            {"label": b["label"], "bucket": b["bucket"], "content": b["content"]}
-                            for b in system_blocks
-                        ],
-                    },
-                    ensure_ascii=False,
-                ),
+                json.dumps(trace_payload, ensure_ascii=False),
                 answer,
             ),
         )
