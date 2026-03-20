@@ -442,6 +442,20 @@ class DB:
         row = await cur.fetchone()
         return dict(row) if row else {}
 
+    async def get_user_by_username(self, username: str) -> dict:
+        assert self.conn
+        cleaned = str(username or "").strip().lstrip("@")
+        if not cleaned:
+            return {}
+        cur = await self.conn.execute(
+            "SELECT user_id,username,first_seen,last_seen "
+            "FROM users WHERE lower(username)=lower(?) "
+            "ORDER BY last_seen DESC LIMIT 1",
+            (cleaned,),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else {}
+
     async def add_message(
         self,
         chat_id: int,
@@ -532,6 +546,47 @@ class DB:
             (chat_id, summary),
         )
         await self.conn.commit()
+
+    async def get_chat_participants(
+        self,
+        chat_id: int,
+        exclude_user_id: int | None = None,
+        limit: int = 10,
+    ) -> list[dict]:
+        """Return other active participants in this chat with their profiles and summaries.
+
+        Each dict contains: user_id, username, display_name, gender, interests, summary.
+        """
+        assert self.conn
+        cur = await self.conn.execute(
+            "SELECT u.user_id, u.username, "
+            "  p.display_name, p.approved_display_name, p.gender, p.interests, "
+            "  s.summary "
+            "FROM users u "
+            "LEFT JOIN user_profiles p ON p.user_id = u.user_id AND p.chat_id = ? "
+            "LEFT JOIN user_chat_summaries s ON s.user_id = u.user_id AND s.chat_id = ? "
+            "WHERE u.user_id IN ("
+            "  SELECT DISTINCT m.user_id FROM messages m "
+            "  WHERE m.chat_id = ? AND m.role = 'user' AND m.user_id != 0"
+            ") "
+            "AND (? IS NULL OR u.user_id != ?) "
+            "ORDER BY u.last_seen DESC "
+            "LIMIT ?",
+            (chat_id, chat_id, chat_id, exclude_user_id, exclude_user_id, limit),
+        )
+        rows = await cur.fetchall()
+        result = []
+        for r in rows:
+            name = r["approved_display_name"] or r["display_name"] or ""
+            result.append({
+                "user_id": r["user_id"],
+                "username": r["username"] or "",
+                "display_name": name,
+                "gender": r["gender"] or "",
+                "interests": r["interests"] or "",
+                "summary": r["summary"] or "",
+            })
+        return result
 
     async def get_user_profile(self, chat_id: int, user_id: int) -> dict:
         assert self.conn
