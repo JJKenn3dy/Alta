@@ -521,8 +521,7 @@ class DB:
                 (chat_id, user_id),
             )
             row = await cur.fetchone()
-            if row:
-                return row["summary"]
+            return row["summary"] if row else ""
 
         cur = await self.conn.execute("SELECT summary FROM chat_summary WHERE chat_id=?", (chat_id,))
         row = await cur.fetchone()
@@ -552,27 +551,31 @@ class DB:
         chat_id: int,
         exclude_user_id: int | None = None,
         limit: int = 10,
+        recent_message_window: int = 200,
     ) -> list[dict]:
-        """Return other active participants in this chat with their profiles and summaries.
+        """Return other recently active participants with profile info (no private summaries).
 
-        Each dict contains: user_id, username, display_name, gender, interests, summary.
+        Uses a bounded scan of recent messages to find active users efficiently
+        even in chats with 50+ participants.
+        Each dict contains: user_id, username, display_name, gender, interests.
         """
         assert self.conn
         cur = await self.conn.execute(
             "SELECT u.user_id, u.username, "
-            "  p.display_name, p.approved_display_name, p.gender, p.interests, "
-            "  s.summary "
+            "  p.display_name, p.approved_display_name, p.gender, p.interests "
             "FROM users u "
             "LEFT JOIN user_profiles p ON p.user_id = u.user_id AND p.chat_id = ? "
-            "LEFT JOIN user_chat_summaries s ON s.user_id = u.user_id AND s.chat_id = ? "
             "WHERE u.user_id IN ("
-            "  SELECT DISTINCT m.user_id FROM messages m "
-            "  WHERE m.chat_id = ? AND m.role = 'user' AND m.user_id != 0"
+            "  SELECT DISTINCT sub.user_id FROM ("
+            "    SELECT m.user_id FROM messages m "
+            "    WHERE m.chat_id = ? AND m.role = 'user' AND m.user_id != 0 "
+            "    ORDER BY m.id DESC LIMIT ?"
+            "  ) sub"
             ") "
             "AND (? IS NULL OR u.user_id != ?) "
             "ORDER BY u.last_seen DESC "
             "LIMIT ?",
-            (chat_id, chat_id, chat_id, exclude_user_id, exclude_user_id, limit),
+            (chat_id, chat_id, recent_message_window, exclude_user_id, exclude_user_id, limit),
         )
         rows = await cur.fetchall()
         result = []
@@ -584,7 +587,6 @@ class DB:
                 "display_name": name,
                 "gender": r["gender"] or "",
                 "interests": r["interests"] or "",
-                "summary": r["summary"] or "",
             })
         return result
 
@@ -818,8 +820,8 @@ class DB:
             ") VALUES(?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(chat_id,user_id,fact_type,normalized_value) DO UPDATE SET "
             "value=excluded.value,"
-            "confidence=MAX(user_facts.confidence, excluded.confidence),"
-            "importance=MAX(user_facts.importance, excluded.importance),"
+            "confidence=excluded.confidence,"
+            "importance=excluded.importance,"
             "evidence=CASE WHEN excluded.evidence<>'' THEN excluded.evidence ELSE user_facts.evidence END,"
             "source=CASE WHEN excluded.source<>'' THEN excluded.source ELSE user_facts.source END,"
             "updated_at=datetime('now'),"

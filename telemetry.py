@@ -11,7 +11,7 @@ from typing import Any
 log = logging.getLogger("alta.telemetry")
 
 
-CHARS_PER_TOKEN_HEURISTIC = 4.0
+CHARS_PER_TOKEN_HEURISTIC = 3.2
 
 
 def approx_text_tokens(text: Any) -> int:

@@ -13,6 +13,8 @@ DEFAULT_CHUNK_OVERLAP = 120
 DEFAULT_QUERY_CHUNKS = 3
 DEFAULT_QUERY_CHARS = 1_800
 MAX_CHUNKS_TO_SCORE = 4_000
+LORE_PATH_PREFIX = "lore_"
+LORE_SCORE_BOOST = 2.0
 
 TEXT_FILE_EXTENSIONS = {
     ".txt",
@@ -259,6 +261,12 @@ async def sync_context_dir(
         await db.delete_context_file(rel_path)
 
 
+def _is_lore_path(path: str) -> bool:
+    """Check if chunk belongs to a lore file (lore_ prefix in filename)."""
+    name = path.rsplit("/", 1)[-1] if "/" in path else path
+    return name.lower().startswith(LORE_PATH_PREFIX)
+
+
 def _score_chunk(path: str, normalized_text: str, query: str, tokens: list[str]) -> float:
     score = 0.0
     normalized_path = _normalize_text(path)
@@ -275,6 +283,10 @@ def _score_chunk(path: str, normalized_text: str, query: str, tokens: list[str])
         if marker in normalized_text:
             score += 1.25
 
+    # Lore files get a scoring boost so personality context is prioritized
+    if score > 0 and _is_lore_path(path):
+        score += LORE_SCORE_BOOST
+
     return score
 
 
@@ -286,19 +298,34 @@ async def retrieve_context_snippets(
     max_chars: int = DEFAULT_QUERY_CHARS,
 ) -> list[dict]:
     tokens = _query_tokens(query_text)
-    if not tokens:
+    chunks = await db.get_context_chunks(limit=MAX_CHUNKS_TO_SCORE)
+
+    if not tokens and not chunks:
         return []
 
-    normalized_query = _normalize_text(" ".join(tokens))
-    chunks = await db.get_context_chunks(limit=MAX_CHUNKS_TO_SCORE)
+    normalized_query = _normalize_text(" ".join(tokens)) if tokens else ""
     scored: list[tuple[float, dict]] = []
+    lore_candidates: list[tuple[float, dict]] = []
 
     for chunk in chunks:
+        path = str(chunk.get("path") or "")
         normalized_text = str(chunk.get("normalized_text") or "")
-        score = _score_chunk(str(chunk.get("path") or ""), normalized_text, normalized_query, tokens)
+        is_lore = _is_lore_path(path)
+
+        if tokens:
+            score = _score_chunk(path, normalized_text, normalized_query, tokens)
+        else:
+            score = 0.0
+
+        # Lore files always get a baseline score so personality context is available
+        if is_lore and score < LORE_SCORE_BOOST:
+            score = LORE_SCORE_BOOST
+
         if score <= 0:
             continue
         scored.append((score, chunk))
+        if is_lore:
+            lore_candidates.append((score, chunk))
 
     scored.sort(
         key=lambda item: (
@@ -308,16 +335,39 @@ async def retrieve_context_snippets(
         )
     )
 
+    # Separate lore from non-lore: lore gets added outside the max_chunks limit
     selected: list[dict] = []
     chars_used = 0
     file_hits: dict[str, int] = {}
     seen_chunks: set[tuple[str, int]] = set()
+    non_lore_count = 0
 
+    # First pass: add up to 1 lore chunk (always, if available)
+    if lore_candidates:
+        lore_candidates.sort(key=lambda item: -item[0])
+        for _score, chunk in lore_candidates:
+            path = str(chunk.get("path") or "")
+            chunk_index = int(chunk.get("chunk_index") or 0)
+            content = str(chunk.get("content") or "").strip()
+            if not content:
+                continue
+            payload_size = len(path) + len(content)
+            if payload_size > max_chars:
+                continue
+            selected.append({"path": path, "content": content, "score": _score})
+            seen_chunks.add((path, chunk_index))
+            file_hits[path] = file_hits.get(path, 0) + 1
+            chars_used += payload_size
+            break
+
+    # Second pass: fill remaining slots with non-lore chunks
     for score, chunk in scored:
         path = str(chunk.get("path") or "")
         chunk_index = int(chunk.get("chunk_index") or 0)
         key = (path, chunk_index)
         if key in seen_chunks:
+            continue
+        if _is_lore_path(path):
             continue
         if file_hits.get(path, 0) >= 2:
             continue
@@ -334,7 +384,8 @@ async def retrieve_context_snippets(
         seen_chunks.add(key)
         file_hits[path] = file_hits.get(path, 0) + 1
         chars_used += payload_size
-        if len(selected) >= max_chunks:
+        non_lore_count += 1
+        if non_lore_count >= max_chunks:
             break
 
     return selected
@@ -344,15 +395,35 @@ def build_file_context_block(snippets: list[dict]) -> str:
     if not snippets:
         return ""
 
-    parts = [
-        "Local file context. Use it only when it is relevant to the user's request.",
-        "Do not pretend to know anything outside these snippets.",
-    ]
+    lore_parts: list[str] = []
+    file_parts: list[str] = []
+
     for snippet in snippets:
         path = str(snippet.get("path") or "").strip()
         content = str(snippet.get("content") or "").strip()
         if not path or not content:
             continue
-        parts.append(f"[{path}]\n{content}")
+        if _is_lore_path(path):
+            lore_parts.append(content)
+        else:
+            file_parts.append(f"[{path}]\n{content}")
+
+    parts: list[str] = []
+    if lore_parts:
+        parts.append(
+            "Ниже твой внутренний бэкграунд (внешность, характер, вкусы). "
+            "Ты знаешь это о себе, но НИКОГДА не зачитывай как список. "
+            "Отвечай как живой человек, упоминай только то, что спросили, "
+            "и формулируй естественно своими словами. "
+            "Например на вопрос 'как выглядишь' не перечисляй всё подряд, "
+            "а скажи пару деталей как будто описываешь себя в разговоре.\n"
+            + "\n".join(lore_parts)
+        )
+    if file_parts:
+        parts.append(
+            "Локальный файловый контекст. Используй только когда он релевантен запросу пользователя.\n"
+            "Не делай вид, что знаешь что-то за пределами этих фрагментов."
+        )
+        parts.extend(file_parts)
 
     return "\n\n".join(parts).strip()

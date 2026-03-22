@@ -11,7 +11,7 @@ log = logging.getLogger("alta")
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatType
-from aiogram.types import Message, MessageReactionUpdated
+from aiogram.types import BufferedInputFile, ChatPermissions, Message, MessageReactionUpdated
 
 from agent import ReplyContext, RouteTurn, route_mode, route_reason, run_agent
 from config import load_config
@@ -26,6 +26,7 @@ from media import (
 )
 from runtime_io import configure_stdio
 from telemetry import Telemetry
+from voice import ElevenLabsError, ElevenLabsTTS, detect_voice_request
 
 BOT_ALIASES = [
     "\u0430\u043b\u044c\u0442\u0430",
@@ -115,6 +116,7 @@ class LockRegistry:
 _cooldown_calls = CooldownManager(max_size=5000, evict_after=3600.0)
 _cooldown_reaction = CooldownManager(max_size=5000, evict_after=3600.0)
 _cooldown_verification = CooldownManager(max_size=1000, evict_after=600.0)
+_cooldown_voice = CooldownManager(max_size=5000, evict_after=3600.0)
 _chat_locks = LockRegistry(max_size=2000)
 WORD_BOUNDARY_CLASS = "0-9A-Za-z\u0410-\u042f\u0430-\u044f\u0401\u0451_"
 MEDIA_REPLY_COOLDOWN_KEY = "media_reply"
@@ -141,7 +143,7 @@ ALIAS_PATTERNS = _compile_alias_patterns(BOT_ALIASES)
 BRACKET_USERNAME_RE = re.compile(r"\[(@?[A-Za-z][A-Za-z0-9_]{4,31})\]")
 CODE_RE = re.compile(r"\b(\d{4})\b")
 LEADING_USER_TAG_RE = re.compile(
-    r"^\s*\[\s*(?:id=)?\d+(?:\s+@[A-Za-z0-9_]{4,32})?\s*\]\s*",
+    r"^\s*\[\s*(?:(?:to\s+)?(?:current\s+speaker\s+)?)?(?:id=)?\d+(?:\s+@[A-Za-z0-9_]{4,32})?\s*\]\s*",
     re.IGNORECASE,
 )
 LEADING_ROLE_TAG_RE = re.compile(r"^\s*(?:system|user|assistant)\s*:\s*", re.IGNORECASE)
@@ -265,6 +267,18 @@ def cooldown_ok(chat_id: int, user_id: int, cooldown_sec: int) -> bool:
 
 def reaction_ack_cooldown_ok(chat_id: int, user_id: int, cooldown_sec: int = 180) -> bool:
     return _cooldown_reaction.check((chat_id, user_id), cooldown_sec)
+
+
+def voice_reply_cooldown_ready(chat_id: int, user_id: int, cooldown_sec: int) -> bool:
+    if cooldown_sec <= 0:
+        return True
+    now = time.time()
+    last = _cooldown_voice.get_last((chat_id, user_id))
+    return (now - last) >= cooldown_sec
+
+
+def mark_voice_reply_cooldown(chat_id: int, user_id: int) -> None:
+    _cooldown_voice.record((chat_id, user_id))
 
 
 async def media_cooldown_ok(db: DB, chat_id: int, user_id: int, cooldown_sec: int) -> bool:
@@ -484,6 +498,17 @@ def _extract_code_candidate(text: str) -> str | None:
     return m.group(1) if m else None
 
 
+_SPAM_URL_RE = re.compile(
+    r"(?:https?://|t\.me/|tg://|bit\.ly/|goo\.gl/|@[A-Za-z][A-Za-z0-9_]{4,})",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_spam(text: str) -> bool:
+    """Return True if text looks like spam (contains links, telegram handles, etc.)."""
+    return bool(_SPAM_URL_RE.search(text or ""))
+
+
 def is_emoji_only_message(text: str) -> bool:
     t = (text or "").strip()
     if not t:
@@ -514,6 +539,8 @@ async def main():
         cfg.llm_model,
         max_context_tokens=cfg.llm_context_window,
         context_safety_margin=cfg.llm_context_safety_margin,
+        frequency_penalty=cfg.frequency_penalty,
+        presence_penalty=cfg.presence_penalty,
     )
     telemetry = Telemetry(
         enabled=cfg.enable_metrics,
@@ -521,6 +548,15 @@ async def main():
         log_path=cfg.orchestration_log_path,
     )
     log.info("llm client ready")
+    voice_tts = ElevenLabsTTS(cfg)
+    log.info(
+        "voice replies: configured=%s prob=%.2f cooldown=%ss max_chars=%s format=%s",
+        voice_tts.is_configured,
+        cfg.voice_reply_prob,
+        cfg.voice_reply_cooldown_sec,
+        cfg.voice_reply_max_chars,
+        voice_tts.extension,
+    )
 
     media_catalog = await maybe_refresh_media_catalog(bot, cfg.media_catalog_path)
     log.info(
@@ -570,7 +606,7 @@ async def main():
             await bot.ban_chat_member(**_join_verification_ban_kwargs(chat_id=chat_id, user_id=user_id))
             log.info("join-check: banned user=%s chat=%s reason=%s", user_id, chat_id, reason)
             return True
-        except Exception:
+        except Exception as exc:
             log.warning(
                 "join-check: failed to ban user=%s chat=%s reason=%s",
                 user_id,
@@ -578,6 +614,14 @@ async def main():
                 reason,
                 exc_info=True,
             )
+            try:
+                await bot.send_message(
+                    chat_id,
+                    f"Не удалось забанить пользователя {user_id}: {exc}. "
+                    f"Проверьте, что у бота есть право банить участников.",
+                )
+            except Exception:
+                pass
             return False
 
     async def schedule_join_timeout(chat_id: int, user_id: int, timeout_sec: int):
@@ -590,8 +634,8 @@ async def main():
         try:
             await bot.send_message(
                 chat_id,
-                f"Anti-bot check timeout for user {user_id}. Account is now banned. "
-                f"If this was a mistake: /unban {user_id}",
+                f"Пользователь {user_id} не прошёл проверку вовремя и забанен. "
+                f"Если ошибка: /unban {user_id}",
             )
         except Exception:
             log.warning(
@@ -632,9 +676,10 @@ async def main():
                 )
                 if banned:
                     try:
-                        await message.reply(
-                            f"Bot account {m.id} was banned by anti-bot gate. "
-                            f"If this is a mistake: /unban {m.id}"
+                        await bot.send_message(
+                            chat_id,
+                            f"Бот-аккаунт {m.id} забанен. "
+                            f"Если ошибка: /unban {m.id}",
                         )
                     except Exception:
                         log.debug(
@@ -653,20 +698,107 @@ async def main():
                 old.task.cancel()
 
             timeout_sec = max(20, cfg.join_verification_timeout_sec)
+
+            # Mute user immediately so they cannot post until verified
+            try:
+                await bot.restrict_chat_member(
+                    chat_id=chat_id,
+                    user_id=m.id,
+                    permissions=ChatPermissions(
+                        can_send_messages=True,
+                        can_send_audios=False,
+                        can_send_documents=False,
+                        can_send_photos=False,
+                        can_send_videos=False,
+                        can_send_video_notes=False,
+                        can_send_voice_notes=False,
+                        can_send_polls=False,
+                        can_send_other_messages=False,
+                        can_add_web_page_previews=False,
+                        can_invite_users=False,
+                    ),
+                )
+                log.info("join-check: muted user=%s chat=%s", m.id, chat_id)
+            except Exception:
+                log.warning(
+                    "join-check: failed to mute user=%s chat=%s",
+                    m.id,
+                    chat_id,
+                    exc_info=True,
+                )
+
+            who = f"@{m.username}" if m.username else (m.first_name or "новый участник")
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=message.message_id)
+            except Exception:
+                log.debug(
+                    "join-check: failed to delete join service message chat=%s msg=%s",
+                    chat_id,
+                    message.message_id,
+                    exc_info=True,
+                )
+            verify_msg = await bot.send_message(
+                chat_id,
+                f"{who}, антибот-проверка: отправь код {code} в течение {timeout_sec} сек.\n"
+                f"Если не пройдёшь — бан.",
+            )
+
             task = asyncio.create_task(schedule_join_timeout(chat_id, m.id, timeout_sec))
             _pending_join_verification[key] = JoinVerification(
                 code=code,
                 deadline_ts=time.time() + timeout_sec,
                 task=task,
-                join_message_id=message.message_id,
-            )
-
-            who = f"@{m.username}" if m.username else (m.first_name or "new user")
-            await message.reply(
-                f"{who}, anti-bot check: send code {code} within {timeout_sec} sec.\n"
-                f"If check fails, account will be banned. Admin recovery: /unban {m.id}."
+                join_message_id=verify_msg.message_id,
             )
             log.info("join-check: started user=%s chat=%s", m.id, chat_id)
+
+    @dp.message(~F.text & ~F.new_chat_members)
+    async def on_non_text_message(message: Message):
+        """Delete non-text messages (photos, stickers, etc.) from unverified users and ban bots."""
+        if message.chat.type == ChatType.PRIVATE:
+            return
+        chat_id = message.chat.id
+        if not await db.is_allowed(chat_id):
+            return
+        if not message.from_user:
+            return
+
+        # Ban bot accounts sending non-text content
+        if message.from_user.is_bot and message.from_user.id != bot_id:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=message.message_id)
+            except Exception:
+                pass
+            await apply_join_verification_ban(
+                chat_id=chat_id,
+                user_id=message.from_user.id,
+                reason="bot-non-text-message",
+            )
+            return
+
+        key = (chat_id, message.from_user.id)
+        pending = _pending_join_verification.get(key)
+        if pending:
+            # Unverified user sending media — delete and instant ban
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=message.message_id)
+            except Exception:
+                pass
+            await apply_join_verification_ban(
+                chat_id=chat_id,
+                user_id=message.from_user.id,
+                reason="media-before-verification",
+                join_message_id=pending.join_message_id,
+            )
+            try:
+                await bot.send_message(
+                    chat_id,
+                    f"Пользователь {message.from_user.id} забанен (медиа до проверки). "
+                    f"Если ошибка: /unban {message.from_user.id}",
+                )
+            except Exception:
+                pass
+            return
 
     @dp.message(F.text)
     async def on_message(message: Message):
@@ -682,6 +814,20 @@ async def main():
 
         if not message.from_user:
             log.debug("skip: no from_user")
+            return
+
+        # Ban bot accounts that somehow post text messages
+        if message.from_user.is_bot and message.from_user.id != bot_id:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=message.message_id)
+            except Exception:
+                pass
+            await apply_join_verification_ban(
+                chat_id=chat_id,
+                user_id=message.from_user.id,
+                reason="bot-text-message",
+            )
+            log.info("join-check: banned bot sending text user=%s chat=%s", message.from_user.id, chat_id)
             return
 
         user_id = message.from_user.id
@@ -708,7 +854,7 @@ async def main():
                     )
                     can_unban = False
             if not can_unban:
-                await message.reply("Only chat admins with ban rights can use /unban.")
+                await message.reply("Только админы с правом бана могут использовать /unban.")
                 return
 
             target_id: int | None = None
@@ -726,7 +872,7 @@ async def main():
 
             if target_id is None:
                 await message.reply(
-                    "Usage: /unban <user_id|@username> or reply to a user with /unban."
+                    "Использование: /unban <user_id|@username> или ответь на сообщение пользователя с /unban."
                 )
                 return
 
@@ -740,12 +886,12 @@ async def main():
                     target_id,
                     exc_info=True,
                 )
-                await message.reply(f"Failed to unban user {target_id}. Check bot permissions.")
+                await message.reply(f"Не удалось разбанить {target_id}. Проверь права бота.")
                 return
 
             _pending_join_verification.pop((chat_id, target_id), None)
             _cooldown_verification.pop((chat_id, target_id))
-            await message.reply(f"User {target_id} was unbanned.")
+            await message.reply(f"Пользователь {target_id} разбанен.")
             log.info("unban: actor=%s target=%s chat=%s", user_id, target_id, chat_id)
             return
 
@@ -757,6 +903,40 @@ async def main():
                 pending.task.cancel()
                 _pending_join_verification.pop(key, None)
                 _cooldown_verification.pop(key)
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=pending.join_message_id)
+                except Exception:
+                    pass
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=message.message_id)
+                except Exception:
+                    pass
+                # Unmute user — restore default permissions
+                try:
+                    await bot.restrict_chat_member(
+                        chat_id=chat_id,
+                        user_id=user_id,
+                        permissions=ChatPermissions(
+                            can_send_messages=True,
+                            can_send_audios=True,
+                            can_send_documents=True,
+                            can_send_photos=True,
+                            can_send_videos=True,
+                            can_send_video_notes=True,
+                            can_send_voice_notes=True,
+                            can_send_polls=True,
+                            can_send_other_messages=True,
+                            can_add_web_page_previews=True,
+                            can_invite_users=True,
+                        ),
+                    )
+                except Exception:
+                    log.warning(
+                        "join-check: failed to unmute user=%s chat=%s",
+                        user_id,
+                        chat_id,
+                        exc_info=True,
+                    )
                 await db.upsert_memory(
                     chat_id,
                     user_id,
@@ -766,18 +946,41 @@ async def main():
                     importance=1.0,
                     source="join_verification",
                 )
-                await message.reply("Ок, проверка пройдена, добро пожаловать.")
+                await bot.send_message(chat_id, "Проверка пройдена, добро пожаловать.")
                 log.info("join-check: passed user=%s chat=%s", user_id, chat_id)
             else:
-                now = time.time()
-                last_hint = _cooldown_verification.get_last(key)
-                if now - last_hint > 10:
-                    _cooldown_verification.record(key)
-                    remaining = max(1, int(pending.deadline_ts - now))
-                    await message.reply(
-                        f"Сначала пройди проверку: отправь код {pending.code}. "
-                        f"Осталось примерно {remaining} сек."
+                # Delete any non-code message from unverified user
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=message.message_id)
+                except Exception:
+                    pass
+                # If message contains links/mentions — instant ban (spam bot)
+                if _looks_like_spam(text):
+                    await apply_join_verification_ban(
+                        chat_id=chat_id,
+                        user_id=user_id,
+                        reason="spam-before-verification",
+                        join_message_id=pending.join_message_id,
                     )
+                    try:
+                        await bot.send_message(
+                            chat_id,
+                            f"Пользователь {user_id} забанен (спам до прохождения проверки). "
+                            f"Если ошибка: /unban {user_id}",
+                        )
+                    except Exception:
+                        pass
+                else:
+                    now = time.time()
+                    last_hint = _cooldown_verification.get_last(key)
+                    if now - last_hint > 10:
+                        _cooldown_verification.record(key)
+                        remaining = max(1, int(pending.deadline_ts - now))
+                        await bot.send_message(
+                            chat_id,
+                            f"Сначала пройди проверку: отправь код {pending.code}. "
+                            f"Осталось примерно {remaining} сек.",
+                        )
             return
 
         approval_text = sanitize_incoming_text(text)
@@ -832,12 +1035,22 @@ async def main():
             log.debug("skip: cooldown")
             return
 
-        clean_text = sanitize_incoming_text(strip_mention(text, bot_username))
-        requested_display_name = extract_requested_display_name(clean_text)
+        stripped_text = sanitize_incoming_text(strip_mention(text, bot_username))
+        clean_text = sanitize_incoming_text(text)
+        voice_request = detect_voice_request(stripped_text)
+        force_voice_reply = bool(voice_request and voice_request.requested)
+        direct_voice_text = ""
+        if voice_request and voice_request.direct_text:
+            direct_voice_text = sanitize_outgoing_text(
+                convert_bracket_mentions_to_tg(voice_request.content)
+            )
+            if not direct_voice_text:
+                direct_voice_text = " ".join((voice_request.content or "").split())
+        requested_display_name = extract_requested_display_name(stripped_text)
         mention_only = False
-        if not clean_text:
+        if not stripped_text:
             mention_only = True
-        log.debug("clean_text=%r", clean_text)
+        log.debug("clean_text=%r stripped=%r", clean_text, stripped_text)
         reply_context = None
         if message.reply_to_message and message.reply_to_message.from_user:
             reply_source = message.reply_to_message
@@ -854,6 +1067,13 @@ async def main():
                 first_name=reply_source.from_user.first_name,
                 text=reply_text,
             )
+        agent_input_text = clean_text
+        if voice_request and not voice_request.direct_text:
+            requested_topic = sanitize_incoming_text(voice_request.content)
+            if requested_topic:
+                agent_input_text = requested_topic
+            elif reply_context and reply_context.text:
+                agent_input_text = reply_context.text
         has_attachments = any(
             (
                 message.photo,
@@ -865,7 +1085,7 @@ async def main():
                 message.voice,
             )
         )
-        turn = RouteTurn(text_clean=clean_text, has_file=has_attachments)
+        turn = RouteTurn(text_clean=stripped_text, has_file=has_attachments)
         mode = route_mode(turn)
         routed_reason = route_reason(turn)
         turn_id = uuid.uuid4().hex
@@ -910,7 +1130,7 @@ async def main():
                             log.info("emoji-reply: user=%s kind=%s emoji=%s set=%s", user_id, item.get('kind'), item.get('emoji'), item.get('set_name'))
                             return
 
-                await db.add_message(chat_id, user_id, "user", clean_text)
+                await db.add_message(chat_id, user_id, "user", stripped_text)
                 if requested_display_name:
                     if cfg.creator_user_id is None:
                         await message.reply(
@@ -950,46 +1170,120 @@ async def main():
                     )
                     log.info("name-approval: requested user=%s chat=%s name=%r", user_id, chat_id, requested_display_name)
                     return
-                await bot.send_chat_action(chat_id, "typing")
+                answer = ""
+                if direct_voice_text:
+                    answer = strip_foreign_leading_mention(direct_voice_text, username)
+                else:
+                    await bot.send_chat_action(chat_id, "typing")
 
-                try:
-                    answer = await run_agent(
-                        llm=llm,
-                        db=db,
-                        chat_id=chat_id,
-                        user_id=user_id,
-                        input_text=clean_text,
-                        has_attachments=has_attachments,
-                        temperature=cfg.temperature,
-                        top_p=cfg.top_p,
-                        max_tokens=cfg.max_tokens,
-                        history_limit=cfg.history_limit,
-                        debug_traces=cfg.debug_traces,
-                        creator_user_id=cfg.creator_user_id,
-                        creator_profile_path=cfg.creator_profile_path,
-                        sender_username=username,
-                        sender_first_name=first_name,
-                        knowledge_dir=cfg.knowledge_dir,
-                        knowledge_max_files=cfg.knowledge_max_files,
-                        knowledge_max_file_bytes=cfg.knowledge_max_file_bytes,
-                        mention_only=mention_only,
-                        reply_context=reply_context,
-                        turn_id=turn_id,
-                        turn_metrics=turn_metrics,
-                    )
-                except Exception as e:
-                    turn_metrics.set_error(e)
-                    log.error("agent failed: %s", e, exc_info=True)
-                    return
+                    try:
+                        answer = await run_agent(
+                            llm=llm,
+                            db=db,
+                            chat_id=chat_id,
+                            user_id=user_id,
+                            input_text=agent_input_text,
+                            has_attachments=has_attachments,
+                            temperature=cfg.temperature,
+                            top_p=cfg.top_p,
+                            max_tokens=cfg.max_tokens,
+                            history_limit=cfg.history_limit,
+                            debug_traces=cfg.debug_traces,
+                            creator_user_id=cfg.creator_user_id,
+                            creator_profile_path=cfg.creator_profile_path,
+                            sender_username=username,
+                            sender_first_name=first_name,
+                            knowledge_dir=cfg.knowledge_dir,
+                            knowledge_max_files=cfg.knowledge_max_files,
+                            knowledge_max_file_bytes=cfg.knowledge_max_file_bytes,
+                            mention_only=mention_only,
+                            reply_context=reply_context,
+                            turn_id=turn_id,
+                            turn_metrics=turn_metrics,
+                        )
+                    except Exception as e:
+                        turn_metrics.set_error(e)
+                        log.error("agent failed: %s", e, exc_info=True)
+                        return
+
+                    if not answer:
+                        log.warning("empty answer for chat=%s user=%s", chat_id, user_id)
+                        return
+
+                    answer = convert_bracket_mentions_to_tg(answer)
+                    answer = sanitize_outgoing_text(answer)
+                    answer = strip_foreign_leading_mention(answer, username)
 
                 if not answer:
-                    log.warning("empty answer for chat=%s user=%s", chat_id, user_id)
+                    log.warning("empty normalized answer for chat=%s user=%s", chat_id, user_id)
                     return
 
-                answer = convert_bracket_mentions_to_tg(answer)
-                answer = sanitize_outgoing_text(answer)
-                answer = strip_foreign_leading_mention(answer, username)
-                await message.reply(answer)
+                try_random_voice = (
+                    voice_tts.is_configured
+                    and not force_voice_reply
+                    and cfg.voice_reply_prob > 0
+                    and len(answer) <= cfg.voice_reply_max_chars
+                    and voice_reply_cooldown_ready(chat_id, user_id, cfg.voice_reply_cooldown_sec)
+                )
+                should_send_voice = force_voice_reply or (
+                    try_random_voice and random.random() <= cfg.voice_reply_prob
+                )
+
+                sent_voice = False
+                if should_send_voice:
+                    if voice_tts.is_configured:
+                        try:
+                            await bot.send_chat_action(chat_id, "record_voice")
+                        except Exception:
+                            log.debug("voice chat action failed", exc_info=True)
+                        try:
+                            voice_result = await voice_tts.synthesize(answer)
+                            try:
+                                await message.reply_voice(
+                                    voice=BufferedInputFile(
+                                        voice_result.audio_bytes,
+                                        filename=voice_result.filename,
+                                    )
+                                )
+                                sent_voice = True
+                                log.info(
+                                    "voice-reply: user=%s chars=%s kind=voice",
+                                    user_id,
+                                    len(answer),
+                                )
+                            except Exception as send_voice_err:
+                                log.warning(
+                                    "voice send failed, fallback to audio: %s",
+                                    send_voice_err,
+                                    exc_info=True,
+                                )
+                                await message.reply_audio(
+                                    audio=BufferedInputFile(
+                                        voice_result.audio_bytes,
+                                        filename=voice_result.filename,
+                                    ),
+                                    title="Alta",
+                                )
+                                sent_voice = True
+                                log.info(
+                                    "voice-reply: user=%s chars=%s kind=audio",
+                                    user_id,
+                                    len(answer),
+                                )
+                        except ElevenLabsError as e:
+                            log.warning("voice synthesis failed: %s", e)
+                        except Exception as e:
+                            log.warning("voice synthesis unexpected error: %s", e, exc_info=True)
+                    else:
+                        log.info(
+                            "voice-reply skipped: ElevenLabs is not configured user=%s",
+                            user_id,
+                        )
+
+                if sent_voice:
+                    mark_voice_reply_cooldown(chat_id, user_id)
+                else:
+                    await message.reply(answer)
                 await db.add_message(chat_id, bot_id, "assistant", answer, target_user_id=user_id)
                 log.debug("out: %r", answer)
 
@@ -1056,8 +1350,8 @@ async def main():
                 try:
                     await bot.send_message(
                         chat_id,
-                        f"User {user.id} reacted before passing anti-bot check and was banned. "
-                        f"If mistake: /unban {user.id}",
+                        f"Пользователь {user.id} поставил реакцию до прохождения проверки и забанен. "
+                        f"Если ошибка: /unban {user.id}",
                     )
                 except Exception:
                     log.debug(

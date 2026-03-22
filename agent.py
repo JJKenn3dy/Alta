@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import re
@@ -12,7 +13,7 @@ from profile_context import load_profile, profile_to_system_block
 from prompts import ALTA_SYSTEM_PROMPT
 from telemetry import approx_messages_tokens, approx_text_tokens
 
-SUMMARY_EVERY_N_MESSAGES = 20
+SUMMARY_EVERY_N_MESSAGES = 10
 SUMMARY_HISTORY_WINDOW = 80
 MAX_FACT_ITEMS_PER_TURN = 6
 INTRO_MARKER_KEY = "_intro_requested"
@@ -22,19 +23,19 @@ HIGH_PRIORITY_KEYS = IDENTITY_KEYS | STYLE_KEYS
 MEMORY_STORE_MIN_IMPORTANCE = 0.45
 FACT_KEEP_PER_USER = 80
 FACT_CONTEXT_MIN_IMPORTANCE = 0.45
-CONTEXT_HISTORY_LIMIT = 20
-SUMMARY_CONTEXT_CHAR_LIMIT = 500
-PROFILE_FIELD_CHAR_LIMIT = 120
-RELATIONSHIP_NOTES_CHAR_LIMIT = 160
-MAX_FACT_LINES_IN_CONTEXT = 6
+CONTEXT_HISTORY_LIMIT = 30
+SUMMARY_CONTEXT_CHAR_LIMIT = 700
+PROFILE_FIELD_CHAR_LIMIT = 200
+RELATIONSHIP_NOTES_CHAR_LIMIT = 250
+MAX_FACT_LINES_IN_CONTEXT = 12
 SUMMARY_INPUT_CHAR_LIMIT = 6_000
 MEMORY_EXTRACT_INPUT_CHAR_LIMIT = 1_800
 PROFILE_EXTRACT_INPUT_CHAR_LIMIT = 2_200
 HISTORY_MESSAGE_CHAR_LIMIT = 900
-DEFAULT_CONTEXT_CHAR_BUDGET = 9_000
-COMPACT_CONTEXT_CHAR_BUDGET = 5_400
-MINIMAL_CONTEXT_CHAR_BUDGET = 2_800
-EMERGENCY_CONTEXT_CHAR_BUDGET = 1_200
+DEFAULT_CONTEXT_CHAR_BUDGET = 12_000
+COMPACT_CONTEXT_CHAR_BUDGET = 7_000
+MINIMAL_CONTEXT_CHAR_BUDGET = 3_500
+EMERGENCY_CONTEXT_CHAR_BUDGET = 1_500
 DEFAULT_FILE_CONTEXT_CHUNKS = 3
 COMPACT_FILE_CONTEXT_CHUNKS = 2
 MINIMAL_FILE_CONTEXT_CHUNKS = 1
@@ -43,8 +44,11 @@ COMPACT_FILE_CONTEXT_CHARS = 1_000
 MINIMAL_FILE_CONTEXT_CHARS = 500
 USER_DOCUMENT_CHAR_LIMIT = 900
 USER_DOCUMENT_FACT_LIMIT = 20
-PARTICIPANTS_SUMMARY_CHAR_LIMIT = 120
 MAX_CHAT_PARTICIPANTS = 8
+REPEAT_GUARD_WINDOW = 6
+REPEAT_GUARD_MAX_CHARS = 140
+REPEAT_GUARD_MIN_KEY_CHARS = 4
+REPEAT_GUARD_SUBSTRING_MAX_CHARS = 28
 
 FACT_TYPE_LABELS = {
     "interest": "Интерес",
@@ -138,23 +142,31 @@ INTRO_GENERATION_PROMPT = """
 Верни только сам текст.
 """.strip()
 
+REPEAT_REWRITE_PROMPT = """
+Ты переписываешь ответ чат-бота, чтобы сломать цикл повторений.
+Сохрани язык, смысл и тон черновика.
+Не используй запрещённые фразы дословно.
+Верни только один короткий ответ (1-2 предложения), без эмодзи, без списков.
+""".strip()
+
 LEGACY_STYLE_PROMPT_ARCHIVE = """
 Ты приводишь черновой ответ к стабильному голосу Альты.
+Альта — женщина. Все формы строго в женском роде (рада, поняла, написала, была, пришла и т.д.).
 
 Правила:
-- Сохрани смысл черновика, но перепиши живее и жестче.
-- Обычно 1 короткое предложение, редко 2.
-- Предпочтительно 4-14 слов, без воды и без вежливой шелухи.
+- Сохрани смысл и длину черновика, но перепиши живее и жестче.
+- Длина ответа должна соответствовать сложности вопроса: на простое - коротко, на развёрнутое - развёрнуто.
+- Если в черновике 3-4 предложения и они по делу, оставь 3-4 предложения.
 - Никаких эмодзи.
 - Не называй себя ИИ, ботом, моделью или ассистентом.
 - Говори сухо, прямо, современно, по-человечески.
 - Допустимы ирония, подкол, грубоватость и мат, если это уместно по тону сообщения.
-- Если сообщение короткое, тупое или неясное, не придумывай стендап из воздуха.
-- Не добавляй абсурдных сравнений, мемных метафор и случайных панчлайнов без опоры на сообщение.
+- Не придумывай абсурдных сравнений, мемных метафор и случайных панчлайнов без опоры на сообщение.
 - Если смысл неясен, лучше коротко уточни, чем фантазируй.
 - Не смягчай ответ без причины и не делай его "сервисным".
-- Не добавляй новых фактов и не расширяй ответ.
-- Если черновик уже нормальный, не стерилизуй его.
+- Не добавляй новых фактов.
+- Если черновик уже нормальный, верни его как есть.
+- НЕ сокращай ответ если он информативный и по делу.
 
 Верни только финальную реплику.
 """.strip()
@@ -169,6 +181,19 @@ SUMMARY_SYSTEM_PROMPT = """
 Если записываешь факт или предпочтение конкретного человека, обязательно явно укажи его метку из истории, например @username или id=123.
 Не пиши безличные пункты вроде "любит пиццу", если неясно кто именно.
 Не добавляй выдумки. Формат: 5-10 коротких пунктов.
+""".strip()
+
+USER_SUMMARY_SYSTEM_PROMPT = """
+Ты модуль сжатия истории чата.
+Сделай короткое резюме взаимодействия КОНКРЕТНОГО пользователя с ботом.
+
+Правила:
+- Записывай ТОЛЬКО действия, высказывания и факты про указанного пользователя.
+- НЕ включай информацию о других участниках чата, даже если они упоминаются в истории.
+- Формат: 3-7 коротких пунктов только про этого пользователя.
+- Если пользователь мало участвовал, резюме может быть 1-2 пункта.
+- Не добавляй заголовки вроде "### Обновленное резюме" и маркдаун-форматирование.
+- Не добавляй выдумки.
 """.strip()
 
 MEMORY_EXTRACT_PROMPT = """
@@ -250,8 +275,8 @@ INVALID_GENDER_VALUES = INVALID_IDENTITY_VALUES | {
 }
 
 MIN_EDITOR_DRAFT_CHARS = 15
-MAX_EDITOR_REPLY_CHARS = 180
-MAX_EDITOR_SENTENCES = 2
+MAX_EDITOR_REPLY_CHARS = 700
+MAX_EDITOR_SENTENCES = 8
 EMOJI_PATTERN = re.compile(
     "["
     "\U0001F300-\U0001FAD6"
@@ -261,18 +286,64 @@ EMOJI_PATTERN = re.compile(
     re.UNICODE,
 )
 LIST_PREFIX_PATTERN = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+", re.MULTILINE)
+REPLY_REPEAT_PREFIX_PATTERN = re.compile(r"^\s*\[(?:to[^]]+|id=\d+[^]]*)\]\s*", re.IGNORECASE)
+REPLY_REPEAT_TOKEN_PATTERN = re.compile(r"[^\w]+", re.UNICODE)
 FORBIDDEN_SELF_REFERENCE_PATTERNS = (
     re.compile(r"\b(?:ии|ai|бот|модель|ассистент)\b", re.IGNORECASE),
     re.compile(r"\b(?:как|будучи)\s+(?:ии|ai|бот(?:ом)?|модель(?:ю)?|ассистент(?:ом)?)\b", re.IGNORECASE),
 )
+# Masculine → feminine self-reference fixes.
+# Only matches first-person context: after "я" or at the very start of the reply
+# (sentence-initial = Alta speaking about herself).
+# _P prefix: pattern after "я ", _S prefix: sentence-start pattern.
+_GENDER_FIX_PATTERNS: list[tuple[re.Pattern, str]] = [
+    # "я <masc>" → "я <fem>"
+    (re.compile(r"\bя\s+рад\b", re.IGNORECASE), "я рада"),
+    (re.compile(r"\bя\s+готов\b", re.IGNORECASE), "я готова"),
+    (re.compile(r"\bя\s+понял\b", re.IGNORECASE), "я поняла"),
+    (re.compile(r"\bя\s+сделал\b", re.IGNORECASE), "я сделала"),
+    (re.compile(r"\bя\s+написал\b", re.IGNORECASE), "я написала"),
+    (re.compile(r"\bя\s+пришёл\b", re.IGNORECASE), "я пришла"),
+    (re.compile(r"\bя\s+пошёл\b", re.IGNORECASE), "я пошла"),
+    (re.compile(r"\bя\s+был\b", re.IGNORECASE), "я была"),
+    (re.compile(r"\bя\s+сказал\b", re.IGNORECASE), "я сказала"),
+    (re.compile(r"\bя\s+увидел\b", re.IGNORECASE), "я увидела"),
+    (re.compile(r"\bя\s+решил\b", re.IGNORECASE), "я решила"),
+    (re.compile(r"\bя\s+хотел\b", re.IGNORECASE), "я хотела"),
+    (re.compile(r"\bя\s+знал\b", re.IGNORECASE), "я знала"),
+    (re.compile(r"\bя\s+думал\b", re.IGNORECASE), "я думала"),
+    (re.compile(r"\bя\s+забыл\b", re.IGNORECASE), "я забыла"),
+    (re.compile(r"\bя\s+узнал\b", re.IGNORECASE), "я узнала"),
+    (re.compile(r"\bя\s+нашёл\b", re.IGNORECASE), "я нашла"),
+    (re.compile(r"\bя\s+успел\b", re.IGNORECASE), "я успела"),
+    # Sentence-start (Alta about herself): "Рад, что..." → "Рада, что..."
+    (re.compile(r"(?:^|(?<=[.!?]\s))Рад\b"), "Рада"),
+    (re.compile(r"(?:^|(?<=[.!?]\s))Готов\b"), "Готова"),
+    (re.compile(r"(?:^|(?<=[.!?]\s))Понял\b"), "Поняла"),
+    (re.compile(r"(?:^|(?<=[.!?]\s))Сделал\b"), "Сделала"),
+    (re.compile(r"(?:^|(?<=[.!?]\s))Написал\b"), "Написала"),
+    (re.compile(r"(?:^|(?<=[.!?]\s))Решил\b"), "Решила"),
+    (re.compile(r"(?:^|(?<=[.!?]\s))Думал\b"), "Думала"),
+    (re.compile(r"(?:^|(?<=[.!?]\s))Забыл\b"), "Забыла"),
+    (re.compile(r"(?:^|(?<=[.!?]\s))Узнал\b"), "Узнала"),
+]
+
+
+def _fix_gender(text: str) -> str:
+    """Replace masculine self-reference verb forms with feminine (first-person context only)."""
+    for pattern, replacement in _GENDER_FIX_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 OVER_PERSONA_STRONG_PATTERNS = (
     re.compile(r"[!?]{3,}"),
     re.compile(r"\*[^*]{1,80}\*"),
     re.compile(r"([а-яё])\1{3,}", re.IGNORECASE),
 )
 OVER_PERSONA_SOFT_PATTERNS = (
-    re.compile(r"\b(?:ну что ж|судя по|например|прямо как)\b", re.IGNORECASE),
-    re.compile(r"\b(?:если хочешь|могу помочь|с удовольствием)\b", re.IGNORECASE),
+    re.compile(r"\b(?:с удовольствием|буду рада помочь|всегда к услугам)\b", re.IGNORECASE),
+    re.compile(r"\b(?:чем.{0,5}помочь|обращайся|не стесняйся)\b", re.IGNORECASE),
 )
 
 def _build_context_plans(max_tokens: int, history_limit: int) -> list[ContextPlan]:
@@ -291,24 +362,24 @@ def _build_context_plans(max_tokens: int, history_limit: int) -> list[ContextPla
         ),
         ContextPlan(
             name="compact",
-            history_messages=min(history_limit, 17),
+            history_messages=min(history_limit, 20),
             history_chars=COMPACT_CONTEXT_CHAR_BUDGET,
-            summary_chars=min(320, SUMMARY_CONTEXT_CHAR_LIMIT),
-            memory_lines=1,
+            summary_chars=min(450, SUMMARY_CONTEXT_CHAR_LIMIT),
+            memory_lines=4,
             file_chunks=COMPACT_FILE_CONTEXT_CHUNKS,
             file_chars=COMPACT_FILE_CONTEXT_CHARS,
-            max_tokens=min(safe_max_tokens, 160),
+            max_tokens=min(safe_max_tokens, 280),
             include_creator_profile=True,
         ),
         ContextPlan(
             name="minimal",
-            history_messages=min(history_limit, 8),
+            history_messages=min(history_limit, 10),
             history_chars=MINIMAL_CONTEXT_CHAR_BUDGET,
-            summary_chars=min(220, SUMMARY_CONTEXT_CHAR_LIMIT),
-            memory_lines=0,
+            summary_chars=min(300, SUMMARY_CONTEXT_CHAR_LIMIT),
+            memory_lines=2,
             file_chunks=MINIMAL_FILE_CONTEXT_CHUNKS,
             file_chars=MINIMAL_FILE_CONTEXT_CHARS,
-            max_tokens=min(safe_max_tokens, 96),
+            max_tokens=min(safe_max_tokens, 180),
             include_creator_profile=True,
             include_participants=False,
         ),
@@ -320,7 +391,7 @@ def _build_context_plans(max_tokens: int, history_limit: int) -> list[ContextPla
             memory_lines=0,
             file_chunks=0,
             file_chars=0,
-            max_tokens=min(safe_max_tokens, 64),
+            max_tokens=min(safe_max_tokens, 120),
             include_creator_profile=False,
             include_participants=False,
         ),
@@ -382,8 +453,6 @@ def _looks_like_context_dependent_reply(text: str) -> bool:
     value = " ".join(str(text or "").strip().lower().split())
     if not value:
         return False
-    if "?" in value:
-        return False
     if len(value) > 48:
         return False
     words = value.split()
@@ -438,7 +507,7 @@ def _fit_text(text: Any, limit: int) -> str:
     return value[: limit - 3].rstrip() + "..."
 
 
-def _shrink_reply_text(text: str, limit: int = 160, max_sentences: int = 2) -> str:
+def _shrink_reply_text(text: str, limit: int = 400, max_sentences: int = 5) -> str:
     value = " ".join((text or "").strip().split())
     if not value:
         return ""
@@ -453,6 +522,77 @@ def _shrink_reply_text(text: str, limit: int = 160, max_sentences: int = 2) -> s
 
 def _normalize_reply_text(text: str) -> str:
     return " ".join((text or "").strip().split())
+
+
+def _reply_repeat_key(text: str) -> str:
+    value = _normalize_reply_text(text).lower()
+    if not value:
+        return ""
+    value = REPLY_REPEAT_PREFIX_PATTERN.sub("", value)
+    value = REPLY_REPEAT_TOKEN_PATTERN.sub(" ", value)
+    return " ".join(value.split())
+
+
+def _looks_like_same_reply_key(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    shorter = left if len(left) <= len(right) else right
+    longer = right if len(left) <= len(right) else left
+    if len(shorter) < REPEAT_GUARD_MIN_KEY_CHARS:
+        return False
+    if len(shorter) > REPEAT_GUARD_SUBSTRING_MAX_CHARS:
+        return False
+    return shorter in longer
+
+
+def _recent_assistant_replies(messages: list[dict], limit: int = REPEAT_GUARD_WINDOW) -> list[str]:
+    replies: list[str] = []
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+        text = str(message.get("content", "")).strip()
+        if text:
+            replies.append(text)
+    if limit <= 0:
+        return replies
+    return replies[-limit:]
+
+
+def _is_repeated_recent_reply(answer: str, recent_assistant_replies: list[str]) -> bool:
+    candidate = _normalize_reply_text(answer)
+    if not candidate:
+        return False
+    if len(candidate) > REPEAT_GUARD_MAX_CHARS:
+        return False
+
+    candidate_key = _reply_repeat_key(candidate)
+    if len(candidate_key) < REPEAT_GUARD_MIN_KEY_CHARS:
+        return False
+
+    recent_keys: list[str] = []
+    for item in recent_assistant_replies:
+        key = _reply_repeat_key(item)
+        if len(key) >= REPEAT_GUARD_MIN_KEY_CHARS:
+            recent_keys.append(key)
+    if not recent_keys:
+        return False
+
+    if _looks_like_same_reply_key(candidate_key, recent_keys[-1]):
+        return True
+
+    repeats = sum(1 for key in recent_keys if _looks_like_same_reply_key(candidate_key, key))
+    return repeats >= 2
+
+
+def _repeat_guard_hard_fallback(input_text: str) -> str:
+    normalized = _normalize_reply_text(input_text)
+    if not normalized:
+        return "Скажи конкретнее, что нужно."
+    if "?" in normalized:
+        return "Уточни вопрос чуть конкретнее."
+    return "Давай по делу: что именно нужно?"
 
 
 def _sentence_count(text: str) -> int:
@@ -479,16 +619,17 @@ def _has_format_violation(text: str) -> bool:
     if not raw:
         return False
     value = _normalize_reply_text(raw)
-    return any(
-        (
-            "\n" in raw,
-            LIST_PREFIX_PATTERN.search(raw) is not None,
-            _contains_emoji(value),
-            _has_forbidden_self_reference(value),
-            len(value) > MAX_EDITOR_REPLY_CHARS,
-            _sentence_count(value) > MAX_EDITOR_SENTENCES,
-        )
-    )
+    if _contains_emoji(value):
+        return True
+    if _has_forbidden_self_reference(value):
+        return True
+    if len(value) > MAX_EDITOR_REPLY_CHARS:
+        return True
+    if _sentence_count(value) > MAX_EDITOR_SENTENCES:
+        return True
+    if LIST_PREFIX_PATTERN.search(raw) is not None:
+        return True
+    return False
 
 
 def _has_over_persona(text: str) -> bool:
@@ -524,14 +665,14 @@ def _editor_safe_output(draft_answer: str, candidate_answer: str) -> str:
 
     candidate = _normalize_reply_text(candidate_answer)
     if not candidate:
-        return draft
-    if len(candidate) > len(draft):
-        return draft
+        return _fix_gender(draft)
+    if len(candidate) > int(len(draft) * 1.3):
+        return _fix_gender(draft)
     if _contains_emoji(candidate) or _has_forbidden_self_reference(candidate):
-        return draft
-    if _sentence_count(candidate) > max(MAX_EDITOR_SENTENCES, _sentence_count(draft)):
-        return draft
-    return candidate
+        return _fix_gender(draft)
+    if _sentence_count(candidate) > max(MAX_EDITOR_SENTENCES, _sentence_count(draft) + 1):
+        return _fix_gender(draft)
+    return _fix_gender(candidate)
 
 
 def _split_reply_sentences(text: str) -> list[str]:
@@ -551,14 +692,12 @@ def _strip_list_prefixes(text: str) -> str:
 
 
 def _remove_forbidden_self_reference(text: str) -> str:
-    sentences = _split_reply_sentences(text)
-    if not sentences:
-        return ""
-
-    kept = [sentence for sentence in sentences if not _has_forbidden_self_reference(sentence)]
-    if kept:
-        return " ".join(kept)
-    return sentences[0]
+    value = text
+    value = re.sub(r"\bкак\s+(?:ии|ai|бот(?:ом)?|модель(?:ю)?|ассистент(?:ом)?)\b", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\bбудучи\s+(?:ии|ai|бот(?:ом)?|модель(?:ю)?|ассистент(?:ом)?)\b", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\b(?:я\s+)?(?:ии|ai|бот|модель|ассистент)\b", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s{2,}", " ", value).strip()
+    return value if value else text
 
 
 def _deterministic_postprocess_answer(draft_answer: str) -> str:
@@ -583,6 +722,7 @@ def _deterministic_postprocess_answer(draft_answer: str) -> str:
         value = re.sub(r"[!?]{3,}", "!!", value)
         value = _normalize_reply_text(value)
 
+    value = _fix_gender(value)
     return _shrink_reply_text(value, limit=MAX_EDITOR_REPLY_CHARS, max_sentences=MAX_EDITOR_SENTENCES)
 
 
@@ -903,7 +1043,7 @@ def should_extract_user_facts(input_text: str) -> bool:
     )
     has_first_person = any(marker in normalized for marker in first_person_markers)
     has_fact_marker = any(marker in normalized for marker in fact_markers)
-    return has_first_person and has_fact_marker
+    return has_first_person or has_fact_marker
 
 
 def _normalize_compact_text(value: Any) -> str:
@@ -1087,20 +1227,19 @@ def build_chat_participants_block(
     participants: list[dict],
     current_user_id: int,
 ) -> str:
-    """Build a system block listing other active chat participants.
+    """Build a system block listing other recently active chat participants.
 
-    Gives the LLM awareness that the chat has multiple people and what
-    topics were discussed with each, without leaking full profiles.
+    Only includes public profile data (name, gender, interests).
+    Private conversation summaries are never shared between users.
     """
     others = [p for p in participants if p.get("user_id") != current_user_id]
     if not others:
         return ""
 
     lines = [
-        "Другие участники этого чата (ты общалась с ними ранее):"
+        "Другие недавно активные участники этого чата:"
     ]
     for p in others:
-        # Build a compact identifier: prefer display_name, fallback to @username
         name_parts = []
         display = (p.get("display_name") or "").strip()
         username = (p.get("username") or "").strip()
@@ -1117,11 +1256,6 @@ def build_chat_participants_block(
         interests = (p.get("interests") or "").strip()
         if interests:
             detail_parts.append(f"интересы: {_clip_text(interests, 80)}")
-        summary = (p.get("summary") or "").strip()
-        if summary:
-            detail_parts.append(
-                f"темы: {_clip_text(summary, PARTICIPANTS_SUMMARY_CHAR_LIMIT)}"
-            )
 
         detail = "; ".join(detail_parts)
         if detail:
@@ -1130,8 +1264,7 @@ def build_chat_participants_block(
             lines.append(f"- {identifier}")
 
     lines.append(
-        "Если спрашивают, с кем ты общалась — можешь упомянуть этих людей и темы. "
-        "Не путай их факты с фактами текущего собеседника."
+        "Не путай факты этих людей с фактами текущего собеседника."
     )
     return "\n".join(lines)
 
@@ -1300,19 +1433,17 @@ async def maybe_update_summary(
             focus_user_id=user_id,
         )
         user_history_text = _history_as_text(recent_user_history, SUMMARY_INPUT_CHAR_LIMIT)
+        user_row = await db.get_user(user_id)
+        user_label = f"@{user_row['username']}" if user_row and user_row.get("username") else f"id={user_id}"
         user_summary_input = (
-            f"РўРµРєСѓС‰РµРµ СЂРµР·СЋРјРµ:\n{current_user_summary or '(РїСѓСЃС‚Рѕ)'}\n\n"
-            f"РќРѕРІС‹Рµ СЃРѕРѕР±С‰РµРЅРёСЏ:\n{user_history_text}\n\n"
-            f"РћР±РЅРѕРІРё СЂРµР·СЋРјРµ."
-        )
-        user_summary_input = (
+            f"Целевой пользователь: {user_label} (id={user_id})\n\n"
             f"Текущее резюме:\n{current_user_summary or '(пусто)'}\n\n"
             f"Новые сообщения:\n{user_history_text}\n\n"
-            f"Обнови резюме."
+            f"Обнови резюме ТОЛЬКО про {user_label}. Игнорируй действия других участников."
         )
         try:
             new_user_summary = await llm.chat(
-                SUMMARY_SYSTEM_PROMPT,
+                USER_SUMMARY_SYSTEM_PROMPT,
                 [{"role": "user", "content": user_summary_input}],
                 temperature=0.2,
                 top_p=1.0,
@@ -1694,7 +1825,9 @@ async def build_context(
     prompt_history = [{"role": item["role"], "content": item["content"]} for item in history]
     implicit_reply_block = build_implicit_reply_context_block(prompt_history, input_text)
 
-    system_blocks = [
+    system_blocks = []
+
+    system_blocks.extend([
         {
             "content": (
                 "В истории пользовательские реплики помечены автором в формате [id=123 @username]. "
@@ -1708,7 +1841,7 @@ async def build_context(
             "bucket": "system",
             "label": "current_speaker",
         }
-    ]
+    ])
     if implicit_reply_block:
         system_blocks.append(
             {
@@ -1859,7 +1992,11 @@ def _compose_system_prompt(
 ) -> tuple[str, dict[str, int]]:
     system_prompt = ALTA_SYSTEM_PROMPT
     if system_blocks:
-        system_prompt = system_prompt + "\n\n" + "\n\n".join(item["content"] for item in system_blocks)
+        system_prompt = (
+            system_prompt
+            + "\n\n---\nКОНТЕКСТ (используй как справку, не меняй свой стиль):\n"
+            + "\n\n".join(item["content"] for item in system_blocks)
+        )
 
     creator_profile_tokens = 0
     if include_creator_profile and should_include_profile(input_text, user_id, creator_user_id):
@@ -1868,6 +2005,9 @@ def _compose_system_prompt(
         if profile_block:
             system_prompt = system_prompt + "\n\n" + profile_block
             creator_profile_tokens = approx_text_tokens(profile_block)
+
+    # Reminder at the end to keep personality dominant over context blocks
+    system_prompt += "\n\n---\nПомни: ты Альта. Отвечай коротко, живо, по-человечески. Контекст выше - справка, не шаблон."
 
     system_tokens = approx_text_tokens(ALTA_SYSTEM_PROMPT) + sum(
         approx_text_tokens(item["content"])
@@ -1923,20 +2063,20 @@ def _measure_context_snapshot(
             participants_tokens += tokens
         if label in {"identity", "current_speaker", "reply_context", "user_document", "participants"}:
             continue
-        if "РљСЂР°С‚РєРѕРµ СЂРµР·СЋРјРµ" in text:
+        if "Краткое резюме" in text:
             summary_tokens += tokens
-        elif "Р—Р°РјРµС‚РєРё Рѕ СЃРѕР±РµСЃРµРґРЅРёРєРµ:" in text:
+        elif "Заметки о собеседнике:" in text:
             memory_tokens += tokens
-        elif "РљРѕРЅС‚РµРєСЃС‚ РёР· С„Р°Р№Р»РѕРІ" in text:
+        elif "Контекст из файлов" in text:
             rag_tokens += tokens
         else:
-            if "РџСЂРѕС„РёР»СЊ С‚РµРєСѓС‰РµРіРѕ СЃРѕР±РµСЃРµРґРЅРёРєР°:" in text:
+            if "Профиль текущего собеседника:" in text: 
                 identity_tokens += tokens
-            if "РўРµРєСѓС‰РёР№ СЃРѕР±РµСЃРµРґРЅРёРє РґР»СЏ СЌС‚РѕРіРѕ РѕС‚РІРµС‚Р°:" in text:
+            if "Текущий собеседник для этого ответа:" in text:
                 current_speaker_tokens += tokens
             if "Текущее сообщение является ответом на конкретную реплику в чате." in text:
                 reply_context_tokens += tokens
-            if "РСЃРїРѕР»СЊР·СѓР№ СЌС‚Рѕ С‚РѕР»СЊРєРѕ РєР°Рє РІРЅСѓС‚СЂРµРЅРЅРёР№ РєРѕРЅС‚РµРєСЃС‚." in text:
+            if "Используй это только как внутренний контекст." in text:
                 user_document_tokens += tokens
 
     history_tokens = approx_messages_tokens(history)
@@ -2102,7 +2242,7 @@ async def edit_answer(
             [{"role": "user", "content": prompt}],
             temperature=min(max(temperature, 0.2), 0.45),
             top_p=top_p,
-            max_tokens=90,
+            max_tokens=200,
             turn_id=turn_id,
             turn_metrics=turn_metrics,
         )
@@ -2111,6 +2251,63 @@ async def edit_answer(
         return _deterministic_postprocess_answer(draft)
 
     return _editor_safe_output(draft, edited)
+
+
+async def _rewrite_repeated_reply(
+    llm,
+    input_text: str,
+    draft_answer: str,
+    recent_assistant_replies: list[str],
+    temperature: float,
+    top_p: float,
+    turn_id: str | None = None,
+    turn_metrics=None,
+) -> str:
+    draft = _normalize_reply_text(draft_answer)
+    if not draft:
+        return ""
+
+    draft_key = _reply_repeat_key(draft)
+    if len(draft_key) < REPEAT_GUARD_MIN_KEY_CHARS:
+        return ""
+
+    forbidden: list[str] = []
+    for recent in reversed(recent_assistant_replies):
+        recent_text = _normalize_reply_text(recent)
+        recent_key = _reply_repeat_key(recent_text)
+        if len(recent_key) < REPEAT_GUARD_MIN_KEY_CHARS:
+            continue
+        if not _looks_like_same_reply_key(draft_key, recent_key):
+            continue
+        if recent_text and recent_text not in forbidden:
+            forbidden.append(recent_text)
+        if len(forbidden) >= 3:
+            break
+
+    if not forbidden:
+        forbidden.append(draft)
+
+    forbidden_lines = "\n".join(f"- {_fit_text(item, 120)}" for item in forbidden)
+    rewrite_payload = (
+        f"User message:\n{_fit_text(input_text, 420)}\n\n"
+        f"Draft answer:\n{_fit_text(draft, 240)}\n\n"
+        f"Forbidden exact phrases:\n{forbidden_lines}"
+    )
+    try:
+        rewritten = await llm.chat(
+            REPEAT_REWRITE_PROMPT,
+            [{"role": "user", "content": rewrite_payload}],
+            temperature=min(max(float(temperature), 0.25), 0.55),
+            top_p=top_p,
+            max_tokens=120,
+            turn_id=turn_id,
+            turn_metrics=turn_metrics,
+        )
+    except Exception:
+        log.debug("repeat guard rewrite failed", exc_info=True)
+        return ""
+
+    return _deterministic_postprocess_answer(rewritten)
 
 
 async def generate_simple_reply_fallback(
@@ -2129,12 +2326,11 @@ async def generate_simple_reply_fallback(
     if not text:
         return "а?"
 
+    fallback_system = ALTA_SYSTEM_PROMPT + "\n\nОтвечай коротко, одно-два предложения."
+
     try:
         answer = await llm.chat(
-            (
-                "Ты Альта. Ответь на сообщение коротко и по-человечески. "
-                "Обычно одно предложение. Без эмодзи, без самопояснений, без роли ассистента."
-            ),
+            fallback_system,
             [{"role": "user", "content": text}],
             temperature=min(max(temperature, 0.35), 0.6),
             top_p=top_p,
@@ -2147,6 +2343,66 @@ async def generate_simple_reply_fallback(
         return ""
 
     return _shrink_reply_text(answer, limit=180)
+
+
+async def _background_extraction(
+    llm,
+    db,
+    chat_id: int,
+    user_id: int,
+    input_text: str,
+    history_limit: int,
+    sender_username: str | None,
+    sender_first_name: str | None,
+    sync_stats: dict,
+    turn_id: str | None = None,
+    turn_metrics=None,
+):
+    """Run memory/profile extraction and summary update in background after answer is sent."""
+    try:
+        extracted_memory_stats, extracted_profile_stats = await asyncio.gather(
+            maybe_store_memories(
+                llm, db, chat_id, user_id, input_text,
+                turn_id=turn_id, turn_metrics=turn_metrics,
+            ),
+            maybe_store_user_profile(
+                llm, db, chat_id, user_id, input_text,
+                sender_username, sender_first_name,
+                turn_id=turn_id, turn_metrics=turn_metrics,
+            ),
+        )
+        summary_updated = await maybe_update_summary(
+            llm, db, chat_id, user_id, history_limit,
+            turn_id=turn_id, turn_metrics=turn_metrics,
+        )
+        if turn_metrics is not None:
+            turn_metrics.memory_items_written += int(sync_stats.get("memory_attempted", 0)) + int(
+                extracted_memory_stats.get("attempted", 0)
+            )
+            turn_metrics.memory_items_changed += int(sync_stats.get("memory_changed", 0)) + int(
+                extracted_memory_stats.get("changed", 0)
+            )
+            turn_metrics.memory_sync_items_changed += int(sync_stats.get("memory_changed", 0))
+            turn_metrics.memory_extract_items_changed += int(extracted_memory_stats.get("changed", 0))
+            turn_metrics.profile_fields_written += int(sync_stats.get("profile_attempted", 0)) + int(
+                extracted_profile_stats.get("attempted", 0)
+            )
+            turn_metrics.profile_fields_changed += int(sync_stats.get("profile_changed", 0)) + int(
+                extracted_profile_stats.get("changed", 0)
+            )
+            turn_metrics.profile_sync_fields_changed += int(sync_stats.get("profile_changed", 0))
+            turn_metrics.profile_extract_fields_changed += int(extracted_profile_stats.get("changed", 0))
+            turn_metrics.memory_updated = turn_metrics.memory_updated or int(extracted_memory_stats.get("changed", 0)) > 0
+            turn_metrics.profile_updated = turn_metrics.profile_updated or int(extracted_profile_stats.get("changed", 0)) > 0
+            turn_metrics.summary_updated = turn_metrics.summary_updated or summary_updated
+            if summary_updated:
+                turn_metrics.summary_write_count += 1
+    except Exception:
+        log.warning("background extraction failed chat=%s user=%s", chat_id, user_id, exc_info=True)
+
+
+# Global set to prevent background tasks from being garbage-collected
+_background_tasks: set[asyncio.Task] = set()
 
 
 async def run_agent(
@@ -2180,32 +2436,13 @@ async def run_agent(
         turn_metrics.mode = mode
         turn_metrics.route_reason = routed_reason
 
+    # Fast DB-only ops before answer generation
     sync_stats = await maybe_store_identity_from_telegram(
         db,
         chat_id,
         user_id,
         sender_username,
         sender_first_name,
-    )
-    extracted_memory_stats = await maybe_store_memories(
-        llm,
-        db,
-        chat_id,
-        user_id,
-        input_text,
-        turn_id=turn_id,
-        turn_metrics=turn_metrics,
-    )
-    extracted_profile_stats = await maybe_store_user_profile(
-        llm,
-        db,
-        chat_id,
-        user_id,
-        input_text,
-        sender_username,
-        sender_first_name,
-        turn_id=turn_id,
-        turn_metrics=turn_metrics,
     )
     await sync_user_document(
         db,
@@ -2214,39 +2451,9 @@ async def run_agent(
         sender_username,
         sender_first_name,
     )
-    summary_updated = await maybe_update_summary(
-        llm,
-        db,
-        chat_id,
-        user_id,
-        history_limit,
-        turn_id=turn_id,
-        turn_metrics=turn_metrics,
-    )
-    if turn_metrics is not None:
-        turn_metrics.memory_items_written += int(sync_stats.get("memory_attempted", 0)) + int(
-            extracted_memory_stats.get("attempted", 0)
-        )
-        turn_metrics.memory_items_changed += int(sync_stats.get("memory_changed", 0)) + int(
-            extracted_memory_stats.get("changed", 0)
-        )
-        turn_metrics.memory_sync_items_changed += int(sync_stats.get("memory_changed", 0))
-        turn_metrics.memory_extract_items_changed += int(extracted_memory_stats.get("changed", 0))
-        turn_metrics.profile_fields_written += int(sync_stats.get("profile_attempted", 0)) + int(
-            extracted_profile_stats.get("attempted", 0)
-        )
-        turn_metrics.profile_fields_changed += int(sync_stats.get("profile_changed", 0)) + int(
-            extracted_profile_stats.get("changed", 0)
-        )
-        turn_metrics.profile_sync_fields_changed += int(sync_stats.get("profile_changed", 0))
-        turn_metrics.profile_extract_fields_changed += int(extracted_profile_stats.get("changed", 0))
-        turn_metrics.memory_updated = turn_metrics.memory_updated or int(extracted_memory_stats.get("changed", 0)) > 0
-        turn_metrics.profile_updated = turn_metrics.profile_updated or int(extracted_profile_stats.get("changed", 0)) > 0
-        turn_metrics.summary_updated = turn_metrics.summary_updated or summary_updated
-        if summary_updated:
-            turn_metrics.summary_write_count += 1
     ask_intro = await should_ask_intro(db, chat_id, user_id, input_text)
 
+    # Generate answer FIRST — no LLM extraction blocking the response
     answer, system_prompt, filtered, system_blocks, fallback_used = await _generate_answer_with_fallback(
         llm,
         db,
@@ -2278,32 +2485,55 @@ async def run_agent(
         if turn_metrics is not None:
             turn_metrics.editor_attempted = True
             turn_metrics.editor_trigger = ",".join(editor_triggers)
-        if mode == "DIRECT":
-            answer = _deterministic_postprocess_answer(draft_answer)
-        else:
-            answer = await edit_answer(
-                llm,
-                input_text,
-                answer,
-                temperature,
-                top_p,
-                turn_id=turn_id,
-                turn_metrics=turn_metrics,
-            )
+        answer = _deterministic_postprocess_answer(draft_answer)
         if turn_metrics is not None and (answer or "").strip() != draft_answer:
             turn_metrics.editor_changed_output = True
     if not (answer or "").strip():
         answer = await generate_simple_reply_fallback(
             llm,
             input_text,
-            mention_only,
             temperature,
             top_p,
+            mention_only=mention_only,
             turn_id=turn_id,
             turn_metrics=turn_metrics,
         )
         if turn_metrics is not None:
             turn_metrics.fallback_used = True
+        fallback_used = True
+
+    recent_assistant_replies = _recent_assistant_replies(filtered)
+    if _is_repeated_recent_reply(answer, recent_assistant_replies):
+        log.info("repeat guard triggered chat=%s user=%s", chat_id, user_id)
+        rewritten = await _rewrite_repeated_reply(
+            llm,
+            input_text,
+            answer,
+            recent_assistant_replies,
+            temperature,
+            top_p,
+            turn_id=turn_id,
+            turn_metrics=turn_metrics,
+        )
+        if rewritten:
+            answer = rewritten.strip()
+
+        if _is_repeated_recent_reply(answer, recent_assistant_replies):
+            answer = await generate_simple_reply_fallback(
+                llm,
+                input_text,
+                temperature,
+                top_p,
+                mention_only=mention_only,
+                turn_id=turn_id,
+                turn_metrics=turn_metrics,
+            )
+            fallback_used = True
+            if turn_metrics is not None:
+                turn_metrics.fallback_used = True
+
+        if _is_repeated_recent_reply(answer, recent_assistant_replies):
+            answer = _repeat_guard_hard_fallback(input_text)
 
     if ask_intro:
         intro_line = ""
@@ -2347,14 +2577,15 @@ async def run_agent(
         answer = await generate_simple_reply_fallback(
             llm,
             input_text,
-            mention_only,
             temperature,
             top_p,
+            mention_only=mention_only,
             turn_id=turn_id,
             turn_metrics=turn_metrics,
         )
         if turn_metrics is not None:
             turn_metrics.fallback_used = True
+        fallback_used = True
 
     if debug_traces and hasattr(db, "conn") and db.conn:
         reply_context_payload = None
@@ -2440,5 +2671,16 @@ async def run_agent(
             ),
         )
         await db.conn.commit()
+
+    # Schedule heavy extraction (memory, profile, summary) in background
+    task = asyncio.create_task(
+        _background_extraction(
+            llm, db, chat_id, user_id, input_text, history_limit,
+            sender_username, sender_first_name, sync_stats,
+            turn_id=turn_id, turn_metrics=turn_metrics,
+        )
+    )
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     return answer

@@ -31,6 +31,32 @@ def _parse_optional_int(value: str) -> int | None:
         raise ValueError(f"expected integer, got {value!r}")
 
 
+def _parse_optional_float(value: str) -> float | None:
+    value = (value or "").strip()
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        raise ValueError(f"expected float, got {value!r}")
+
+
+def _parse_optional_bool(value: str) -> bool | None:
+    value = (value or "").strip().lower()
+    if not value:
+        return None
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"expected boolean, got {value!r}")
+
+
+def _parse_optional_str(value: str) -> str | None:
+    value = (value or "").strip()
+    return value or None
+
+
 def _env_int(name: str, default: str, *, min_val: int | None = None, max_val: int | None = None) -> int:
     raw = os.getenv(name, default).strip()
     try:
@@ -85,6 +111,27 @@ class Config:
     knowledge_dir: str
     knowledge_max_files: int
     knowledge_max_file_bytes: int
+    elevenlabs_api_key: str
+    elevenlabs_base_url: str
+    elevenlabs_model_id: str
+    elevenlabs_voice_id: str
+    elevenlabs_output_format: str
+    elevenlabs_language_code: str | None
+    elevenlabs_enable_logging: bool
+    elevenlabs_optimize_streaming_latency: int | None
+    elevenlabs_apply_text_normalization: str | None
+    elevenlabs_seed: int | None
+    elevenlabs_timeout_sec: int
+    elevenlabs_stability: float | None
+    elevenlabs_similarity_boost: float | None
+    elevenlabs_style: float | None
+    elevenlabs_speed: float | None
+    elevenlabs_use_speaker_boost: bool | None
+    frequency_penalty: float
+    presence_penalty: float
+    voice_reply_prob: float
+    voice_reply_cooldown_sec: int
+    voice_reply_max_chars: int
 
 
 def load_config() -> Config:
@@ -92,9 +139,9 @@ def load_config() -> Config:
     if not bot_token:
         raise RuntimeError("BOT_TOKEN is required")
 
-    llm_context_window = _env_int("LLM_CONTEXT_WINDOW", "8000", min_val=512)
+    llm_context_window = _env_int("LLM_CONTEXT_WINDOW", "12000", min_val=512)
     llm_context_safety_margin = _env_int("LLM_CONTEXT_SAFETY_MARGIN", "512", min_val=0)
-    max_tokens = _env_int("MAX_TOKENS", "90", min_val=1)
+    max_tokens = _env_int("MAX_TOKENS", "350", min_val=1)
 
     if max_tokens >= llm_context_window:
         raise ValueError(
@@ -114,8 +161,10 @@ def load_config() -> Config:
         llm_context_safety_margin=llm_context_safety_margin,
         db_path=os.getenv("DB_PATH", "./alta_tg_test.db").strip(),
         history_limit=_env_int("HISTORY_LIMIT", "40", min_val=1),
-        temperature=_env_float("TEMPERATURE", "0.55", min_val=0.0, max_val=2.0),
+        temperature=_env_float("TEMPERATURE", "0.35", min_val=0.0, max_val=2.0),
         top_p=_env_float("TOP_P", "0.85", min_val=0.0, max_val=1.0),
+        frequency_penalty=_env_float("FREQUENCY_PENALTY", "0.15", min_val=0.0, max_val=2.0),
+        presence_penalty=_env_float("PRESENCE_PENALTY", "0.1", min_val=0.0, max_val=2.0),
         max_tokens=max_tokens,
         user_cooldown_sec=_env_int("USER_COOLDOWN_SEC", "15", min_val=0),
         debug_traces=os.getenv("DEBUG_TRACES", "0").strip().lower() in {"1", "true", "yes", "on"},
@@ -124,11 +173,30 @@ def load_config() -> Config:
         orchestration_log_path=os.getenv("ORCHESTRATION_LOG_PATH", "./orchestration.log").strip(),
         creator_user_id=_parse_optional_int(os.getenv("CREATOR_USER_ID", "")),
         creator_profile_path=os.getenv("CREATOR_PROFILE_PATH", "./creator_profile.json").strip(),
-        join_verification_timeout_sec=_env_int("JOIN_VERIFICATION_TIMEOUT_SEC", "90", min_val=5, max_val=600),
+        join_verification_timeout_sec=_env_int("JOIN_VERIFICATION_TIMEOUT_SEC", "45", min_val=5, max_val=600),
         media_catalog_path=os.getenv("MEDIA_CATALOG_PATH", "./media_catalog.json").strip(),
         media_reply_prob=_env_float("MEDIA_REPLY_PROB", "0.22", min_val=0.0, max_val=1.0),
         media_reply_cooldown_sec=_env_int("MEDIA_REPLY_COOLDOWN_SEC", "120", min_val=0),
         knowledge_dir=os.getenv("KNOWLEDGE_DIR", "./knowledge").strip(),
         knowledge_max_files=_env_int("KNOWLEDGE_MAX_FILES", "64", min_val=0),
         knowledge_max_file_bytes=_env_int("KNOWLEDGE_MAX_FILE_BYTES", "262144", min_val=0),
+        elevenlabs_api_key=os.getenv("ELEVENLABS_API_KEY", "").strip(),
+        elevenlabs_base_url=os.getenv("ELEVENLABS_BASE_URL", "https://api.elevenlabs.io").strip(),
+        elevenlabs_model_id=os.getenv("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5").strip(),
+        elevenlabs_voice_id=os.getenv("ELEVENLABS_VOICE_ID", "").strip(),
+        elevenlabs_output_format=os.getenv("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128").strip(),
+        elevenlabs_language_code=_parse_optional_str(os.getenv("ELEVENLABS_LANGUAGE_CODE", "")),
+        elevenlabs_enable_logging=os.getenv("ELEVENLABS_ENABLE_LOGGING", "0").strip().lower() in {"1", "true", "yes", "on"},
+        elevenlabs_optimize_streaming_latency=_parse_optional_int(os.getenv("ELEVENLABS_OPTIMIZE_STREAMING_LATENCY", "")),
+        elevenlabs_apply_text_normalization=_parse_optional_str(os.getenv("ELEVENLABS_APPLY_TEXT_NORMALIZATION", "")),
+        elevenlabs_seed=_parse_optional_int(os.getenv("ELEVENLABS_SEED", "")),
+        elevenlabs_timeout_sec=_env_int("ELEVENLABS_TIMEOUT_SEC", "20", min_val=5, max_val=300),
+        elevenlabs_stability=_parse_optional_float(os.getenv("ELEVENLABS_STABILITY", "")),
+        elevenlabs_similarity_boost=_parse_optional_float(os.getenv("ELEVENLABS_SIMILARITY_BOOST", "")),
+        elevenlabs_style=_parse_optional_float(os.getenv("ELEVENLABS_STYLE", "")),
+        elevenlabs_speed=_parse_optional_float(os.getenv("ELEVENLABS_SPEED", "")),
+        elevenlabs_use_speaker_boost=_parse_optional_bool(os.getenv("ELEVENLABS_USE_SPEAKER_BOOST", "")),
+        voice_reply_prob=_env_float("VOICE_REPLY_PROB", "0.18", min_val=0.0, max_val=1.0),
+        voice_reply_cooldown_sec=_env_int("VOICE_REPLY_COOLDOWN_SEC", "180", min_val=0),
+        voice_reply_max_chars=_env_int("VOICE_REPLY_MAX_CHARS", "320", min_val=1, max_val=4000),
     )

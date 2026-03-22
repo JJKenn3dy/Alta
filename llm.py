@@ -5,7 +5,7 @@ import time
 
 from openai import AsyncOpenAI
 from openai import APIConnectionError, APIStatusError, APITimeoutError, BadRequestError, RateLimitError
-from telemetry import LLMCallMetrics, approx_text_tokens
+from telemetry import CHARS_PER_TOKEN_HEURISTIC, LLMCallMetrics, approx_text_tokens
 
 log = logging.getLogger("alta.llm")
 
@@ -16,7 +16,7 @@ class ContextOverflowError(RuntimeError):
 
 DEFAULT_MAX_CONTEXT_TOKENS = 4096
 DEFAULT_CONTEXT_SAFETY_MARGIN = 512
-CHARS_PER_TOKEN_ESTIMATE = 2.0
+CHARS_PER_TOKEN_ESTIMATE = CHARS_PER_TOKEN_HEURISTIC
 
 
 def _looks_like_context_overflow(error: Exception) -> bool:
@@ -24,6 +24,8 @@ def _looks_like_context_overflow(error: Exception) -> bool:
     markers = (
         "context length",
         "context_length",
+        "context size",
+        "context budget",
         "too many tokens",
         "prompt is too long",
         "maximum context",
@@ -62,6 +64,8 @@ class LLM:
         timeout: float = 60.0,
         max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
         context_safety_margin: int = DEFAULT_CONTEXT_SAFETY_MARGIN,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
     ):
         self.client = AsyncOpenAI(
             base_url=base_url,
@@ -71,6 +75,8 @@ class LLM:
         self.model = model
         self.max_retries = max_retries
         self.base_delay = base_delay
+        self.frequency_penalty = frequency_penalty
+        self.presence_penalty = presence_penalty
         self.max_context_tokens = max(256, int(max_context_tokens))
         self.context_safety_margin = max(0, int(context_safety_margin))
 
@@ -94,7 +100,11 @@ class LLM:
         max_tokens: int,
         turn_id: str | None = None,
         turn_metrics=None,
+        frequency_penalty: float | None = None,
+        presence_penalty: float | None = None,
     ) -> str:
+        frequency_penalty = frequency_penalty if frequency_penalty is not None else self.frequency_penalty
+        presence_penalty = presence_penalty if presence_penalty is not None else self.presence_penalty
         last_err = None
         started_at = time.perf_counter()
         call_index = (len(turn_metrics.llm_calls) + 1) if turn_metrics is not None else 1
@@ -131,6 +141,8 @@ class LLM:
                     temperature=temperature,
                     top_p=top_p,
                     max_tokens=max_tokens,
+                    frequency_penalty=frequency_penalty,
+                    presence_penalty=presence_penalty,
                     stream=False,
                 )
                 content = (resp.choices[0].message.content or "").strip()
