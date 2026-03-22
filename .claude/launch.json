@@ -1,0 +1,29 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "Alta Bot",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["main.py"],
+      "port": 0
+    },
+    {
+      "name": "Dashboard",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["dashboard.py"],
+      "port": 8765
+    },
+    {
+      "name": "Dev Trace Dashboard",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["dev_trace_dashboard.py"],
+      "port": 8777
+    },
+    {
+      "name": "Alta Console",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["alta_console.py"],
+      "port": 0
+    }
+  ]
+}
