@@ -517,10 +517,9 @@ class DB:
                     parts.append(f"@{r['username']}")
                 content = f"[{' '.join(parts)}] {r['text']}"
             else:
-                if ts_short:
-                    content = f"[{ts_short}] {r['text']}"
-                else:
-                    content = r["text"]
+                # Don't add timestamps to assistant messages - the model
+                # copies the format and puts [HH:MM] in its own replies
+                content = r["text"]
             out.append({"id": int(r["id"]), "role": r["role"], "content": content, "ts": ts_raw})
         return out
 
