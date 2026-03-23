@@ -161,7 +161,7 @@ def load_config() -> Config:
         llm_context_safety_margin=llm_context_safety_margin,
         db_path=os.getenv("DB_PATH", "./alta_tg_test.db").strip(),
         history_limit=_env_int("HISTORY_LIMIT", "40", min_val=1),
-        temperature=_env_float("TEMPERATURE", "0.35", min_val=0.0, max_val=2.0),
+        temperature=_env_float("TEMPERATURE", "0.55", min_val=0.0, max_val=2.0),
         top_p=_env_float("TOP_P", "0.85", min_val=0.0, max_val=1.0),
         frequency_penalty=_env_float("FREQUENCY_PENALTY", "0.15", min_val=0.0, max_val=2.0),
         presence_penalty=_env_float("PRESENCE_PENALTY", "0.1", min_val=0.0, max_val=2.0),

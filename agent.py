@@ -289,8 +289,10 @@ LIST_PREFIX_PATTERN = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+", re.MULTILINE)
 REPLY_REPEAT_PREFIX_PATTERN = re.compile(r"^\s*\[(?:to[^]]+|id=\d+[^]]*)\]\s*", re.IGNORECASE)
 REPLY_REPEAT_TOKEN_PATTERN = re.compile(r"[^\w]+", re.UNICODE)
 FORBIDDEN_SELF_REFERENCE_PATTERNS = (
-    re.compile(r"\b(?:ии|ai|бот|модель|ассистент)\b", re.IGNORECASE),
+    # Only match self-identification: "я бот", "я ИИ", "я модель", "я ассистент"
+    re.compile(r"\bя\s+(?:ии|ai|бот|модель|ассистент)\b", re.IGNORECASE),
     re.compile(r"\b(?:как|будучи)\s+(?:ии|ai|бот(?:ом)?|модель(?:ю)?|ассистент(?:ом)?)\b", re.IGNORECASE),
+    re.compile(r"\bя\s+(?:языковая|нейро)\s*(?:модель|сеть)\b", re.IGNORECASE),
 )
 # Masculine → feminine self-reference fixes.
 # Only matches first-person context: after "я" or at the very start of the reply
@@ -707,7 +709,8 @@ def _remove_forbidden_self_reference(text: str) -> str:
     value = text
     value = re.sub(r"\bкак\s+(?:ии|ai|бот(?:ом)?|модель(?:ю)?|ассистент(?:ом)?)\b", "", value, flags=re.IGNORECASE)
     value = re.sub(r"\bбудучи\s+(?:ии|ai|бот(?:ом)?|модель(?:ю)?|ассистент(?:ом)?)\b", "", value, flags=re.IGNORECASE)
-    value = re.sub(r"\b(?:я\s+)?(?:ии|ai|бот|модель|ассистент)\b", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\bя\s+(?:ии|ai|бот|модель|ассистент)\b", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\bя\s+(?:языковая|нейро)\s*(?:модель|сеть)\b", "", value, flags=re.IGNORECASE)
     value = re.sub(r"\s{2,}", " ", value).strip()
     return value if value else text
 
