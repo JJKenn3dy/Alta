@@ -480,7 +480,7 @@ class DB:
         assert self.conn
         if focus_user_id is None:
             cur = await self.conn.execute(
-                "SELECT m.id,m.role,m.text,m.user_id,m.target_user_id,u.username "
+                "SELECT m.id,m.role,m.text,m.user_id,m.target_user_id,m.ts,u.username "
                 "FROM messages m "
                 "LEFT JOIN users u ON u.user_id = m.user_id "
                 "WHERE m.chat_id=? "
@@ -489,7 +489,7 @@ class DB:
             )
         else:
             cur = await self.conn.execute(
-                "SELECT m.id,m.role,m.text,m.user_id,m.target_user_id,u.username "
+                "SELECT m.id,m.role,m.text,m.user_id,m.target_user_id,m.ts,u.username "
                 "FROM messages m "
                 "LEFT JOIN users u ON u.user_id = m.user_id "
                 "WHERE m.chat_id=? "
@@ -503,14 +503,25 @@ class DB:
         rows = list(reversed(await cur.fetchall()))
         out: list[dict] = []
         for r in rows:
+            ts_raw = r["ts"] or ""
+            # Format: "2026-03-23 14:31:00" -> "14:31"
+            ts_short = ""
+            if ts_raw and len(ts_raw) >= 16:
+                ts_short = ts_raw[11:16]  # HH:MM
             if r["role"] == "user":
-                parts = [f"id={r['user_id']}"]
+                parts = []
+                if ts_short:
+                    parts.append(ts_short)
+                parts.append(f"id={r['user_id']}")
                 if r["username"]:
                     parts.append(f"@{r['username']}")
                 content = f"[{' '.join(parts)}] {r['text']}"
             else:
-                content = r["text"]
-            out.append({"id": int(r["id"]), "role": r["role"], "content": content})
+                if ts_short:
+                    content = f"[{ts_short}] {r['text']}"
+                else:
+                    content = r["text"]
+            out.append({"id": int(r["id"]), "role": r["role"], "content": content, "ts": ts_raw})
         return out
 
     async def get_summary(self, chat_id: int, user_id: int | None = None) -> str:

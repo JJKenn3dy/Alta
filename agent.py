@@ -3,6 +3,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 log = logging.getLogger("alta.agent")
@@ -47,7 +48,8 @@ USER_DOCUMENT_FACT_LIMIT = 20
 MAX_CHAT_PARTICIPANTS = 8
 REPEAT_GUARD_WINDOW = 6
 REPEAT_GUARD_MAX_CHARS = 140
-REPEAT_GUARD_MIN_KEY_CHARS = 4
+REPEAT_GUARD_MIN_KEY_CHARS = 3
+REPEAT_GUARD_SHORT_EXACT_MIN_KEY_CHARS = 2
 REPEAT_GUARD_SUBSTRING_MAX_CHARS = 28
 
 FACT_TYPE_LABELS = {
@@ -409,6 +411,44 @@ def _is_nonsemantic_input(text: Any) -> bool:
     return normalized in {"", "ping"}
 
 
+TIME_GAP_THRESHOLD_MINUTES = 30
+
+
+def _parse_ts(ts_str: str) -> datetime | None:
+    """Parse a timestamp string from the DB."""
+    if not ts_str:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(ts_str, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _insert_time_gaps(messages: list[dict]) -> list[dict]:
+    """Insert gap markers when there's a significant pause between messages."""
+    if len(messages) < 2:
+        return messages
+
+    result: list[dict] = [messages[0]]
+    for i in range(1, len(messages)):
+        prev_ts = _parse_ts(messages[i - 1].get("ts", ""))
+        curr_ts = _parse_ts(messages[i].get("ts", ""))
+        if prev_ts and curr_ts:
+            gap_minutes = (curr_ts - prev_ts).total_seconds() / 60
+            if gap_minutes >= TIME_GAP_THRESHOLD_MINUTES:
+                if gap_minutes >= 1440:  # 24+ hours
+                    gap_text = f"[... прошло {int(gap_minutes // 1440)} дн. ...]"
+                elif gap_minutes >= 60:
+                    gap_text = f"[... прошло {int(gap_minutes // 60)} ч. ...]"
+                else:
+                    gap_text = f"[... прошло {int(gap_minutes)} мин. ...]"
+                result.append({"role": "system", "content": gap_text})
+        result.append(messages[i])
+    return result
+
+
 def _merge_histories(primary: list[dict], secondary: list[dict], limit: int, char_budget: int) -> list[dict]:
     merged: list[dict] = []
     seen_ids: set[int] = set()
@@ -422,7 +462,8 @@ def _merge_histories(primary: list[dict], secondary: list[dict], limit: int, cha
         merged.append(item)
 
     merged.sort(key=lambda item: int(item.get("id") or 0))
-    return _take_history_with_budget(merged, limit, char_budget)
+    trimmed = _take_history_with_budget(merged, limit, char_budget)
+    return _insert_time_gaps(trimmed)
 
 
 def _format_reply_author(reply_context: ReplyContext) -> str:
@@ -582,16 +623,22 @@ def _is_repeated_recent_reply(answer: str, recent_assistant_replies: list[str]) 
         return False
 
     candidate_key = _reply_repeat_key(candidate)
-    if len(candidate_key) < REPEAT_GUARD_MIN_KEY_CHARS:
-        return False
-
     recent_keys: list[str] = []
     for item in recent_assistant_replies:
         key = _reply_repeat_key(item)
-        if len(key) >= REPEAT_GUARD_MIN_KEY_CHARS:
+        if len(key) >= REPEAT_GUARD_SHORT_EXACT_MIN_KEY_CHARS:
             recent_keys.append(key)
     if not recent_keys:
         return False
+
+    # Handle ultra-short replies with exact matching only ("нет", "да", "ок").
+    if len(candidate_key) < REPEAT_GUARD_MIN_KEY_CHARS:
+        if len(candidate_key) < REPEAT_GUARD_SHORT_EXACT_MIN_KEY_CHARS:
+            return False
+        if candidate_key == recent_keys[-1]:
+            return True
+        repeats = sum(1 for key in recent_keys if key == candidate_key)
+        return repeats >= 2
 
     if _looks_like_same_reply_key(candidate_key, recent_keys[-1]):
         return True
@@ -680,7 +727,11 @@ def _editor_safe_output(draft_answer: str, candidate_answer: str) -> str:
     candidate = _normalize_reply_text(candidate_answer)
     if not candidate:
         return _fix_gender(draft)
-    if len(candidate) > int(len(draft) * 1.3):
+    max_candidate_len = int(len(draft) * 1.3)
+    if len(draft) <= 24:
+        # Allow short drafts to expand into a meaningful 1-2 sentence reply.
+        max_candidate_len = max(max_candidate_len, len(draft) + 80)
+    if len(candidate) > max_candidate_len:
         return _fix_gender(draft)
     if _contains_emoji(candidate) or _has_forbidden_self_reference(candidate):
         return _fix_gender(draft)
@@ -2514,7 +2565,18 @@ async def run_agent(
         if turn_metrics is not None:
             turn_metrics.editor_attempted = True
             turn_metrics.editor_trigger = ",".join(editor_triggers)
-        answer = _deterministic_postprocess_answer(draft_answer)
+        edited_answer = draft_answer
+        if "short_draft" in editor_triggers:
+            edited_answer = await edit_answer(
+                llm,
+                input_text,
+                draft_answer,
+                temperature,
+                top_p,
+                turn_id=turn_id,
+                turn_metrics=turn_metrics,
+            )
+        answer = _deterministic_postprocess_answer(edited_answer or draft_answer)
         if turn_metrics is not None and (answer or "").strip() != draft_answer:
             turn_metrics.editor_changed_output = True
     if not (answer or "").strip():
