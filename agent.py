@@ -772,6 +772,8 @@ def _deterministic_postprocess_answer(draft_answer: str) -> str:
         return ""
 
     value = _strip_list_prefixes(raw) if "\n" in raw or LIST_PREFIX_PATTERN.search(raw) else raw
+    # Strip timestamp prefix the model may copy from history context
+    value = re.sub(r"^\[\d{1,2}:\d{2}\]\s*", "", value)
     value = EMOJI_PATTERN.sub("", value)
     # Replace em-dash / en-dash with a regular hyphen surrounded by spaces
     value = re.sub(r"\s*[—–]\s*", " - ", value)

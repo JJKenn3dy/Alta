@@ -463,6 +463,8 @@ def sanitize_outgoing_text(text: str) -> str:
 
         line = LEADING_USER_TAG_RE.sub("", line)
         line = LEADING_ALTA_TAG_RE.sub("", line)
+        # Strip timestamp prefix that model may copy from history: [HH:MM] or [H:MM]
+        line = re.sub(r"^\[\d{1,2}:\d{2}\]\s*", "", line)
         # Replace em-dash / en-dash with regular hyphen
         line = re.sub(r"\s*[—–]\s*", " - ", line)
         lines.append(line.strip())
