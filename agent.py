@@ -461,17 +461,8 @@ def _looks_like_context_dependent_reply(text: str) -> bool:
     return True
 
 
-def _looks_like_typo_correction(text: str) -> bool:
-    """Detect asterisk-based typo corrections like 'Шеф*' or '*шеф'."""
-    value = str(text or "").strip()
-    if not value:
-        return False
-    return "*" in value and len(value) <= 48
-
-
 def build_implicit_reply_context_block(history: list[dict], input_text: str) -> str:
-    is_typo_correction = _looks_like_typo_correction(input_text)
-    if not is_typo_correction and not _looks_like_context_dependent_reply(input_text):
+    if not _looks_like_context_dependent_reply(input_text):
         return ""
     if len(history) < 2:
         return ""
@@ -484,6 +475,8 @@ def build_implicit_reply_context_block(history: list[dict], input_text: str) -> 
         return ""
 
     prev_bot_text = _fit_text(prev_message.get("content", ""), 300)
+    if not prev_bot_text:
+        return ""
 
     # Find the user's own previous message (before the bot reply)
     prev_user_text = ""
@@ -491,22 +484,6 @@ def build_implicit_reply_context_block(history: list[dict], input_text: str) -> 
         if history[i].get("role") == "user":
             prev_user_text = _fit_text(history[i].get("content", ""), 200)
             break
-
-    if is_typo_correction:
-        parts = [
-            "Текущее сообщение содержит * — это исправление опечатки в предыдущем сообщении.",
-        ]
-        if prev_user_text:
-            parts.append(f"Исходное сообщение пользователя: {prev_user_text}")
-        if prev_bot_text:
-            parts.append(f"Ответ бота на исходное сообщение: {prev_bot_text}")
-        parts.append(
-            "Перечитай исходное сообщение с учётом исправления и ответь на ИСПРАВЛЕННЫЙ вариант."
-        )
-        return "\n".join(parts)
-
-    if not prev_bot_text:
-        return ""
 
     parts = [
         "Текущее сообщение короткое и зависит от контекста предыдущих реплик.",

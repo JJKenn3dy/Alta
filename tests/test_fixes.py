@@ -3,7 +3,6 @@ import unittest
 
 from agent import (
     _looks_like_context_dependent_reply,
-    _looks_like_typo_correction,
     _remove_forbidden_self_reference,
     build_implicit_reply_context_block,
     should_extract_user_facts,
@@ -50,28 +49,17 @@ class ContextDependentReplyTests(unittest.TestCase):
         self.assertFalse(_looks_like_context_dependent_reply(""))
 
 
-class TypoCorrectionTests(unittest.TestCase):
-    def test_asterisk_detected_as_correction(self):
-        """Asterisk is a standard typo correction marker."""
-        self.assertTrue(_looks_like_typo_correction("Шеф*"))
-        self.assertTrue(_looks_like_typo_correction("*шеф"))
-        self.assertTrue(_looks_like_typo_correction("слово*"))
-
-    def test_no_asterisk_not_correction(self):
-        self.assertFalse(_looks_like_typo_correction("просто текст"))
-        self.assertFalse(_looks_like_typo_correction(""))
-
-    def test_implicit_block_includes_user_prev_message(self):
+class ImplicitReplyContextTests(unittest.TestCase):
+    def test_implicit_block_includes_prev_user_message(self):
         """The implicit context should include the user's PREVIOUS message."""
         history = [
-            {"role": "user", "content": "Кто такой шей"},
-            {"role": "assistant", "content": "Шей — это имя. Может, ты про кого-то конкретного?"},
-            {"role": "user", "content": "Шеф*"},
+            {"role": "user", "content": "Кто такой шеф"},
+            {"role": "assistant", "content": "Может, ты про кого-то конкретного?"},
+            {"role": "user", "content": "Ну да"},
         ]
-        block = build_implicit_reply_context_block(history, "Шеф*")
-        self.assertIn("исправление", block.lower())
-        self.assertIn("Кто такой шей", block)
-        self.assertIn("Шей — это имя", block)
+        block = build_implicit_reply_context_block(history, "Ну да")
+        self.assertIn("Кто такой шеф", block)
+        self.assertIn("Может, ты про кого-то", block)
 
     def test_implicit_block_short_reply_includes_prev_user(self):
         """Short context-dependent replies should also show prev user message."""
