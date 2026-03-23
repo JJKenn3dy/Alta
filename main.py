@@ -463,6 +463,8 @@ def sanitize_outgoing_text(text: str) -> str:
 
         line = LEADING_USER_TAG_RE.sub("", line)
         line = LEADING_ALTA_TAG_RE.sub("", line)
+        # Replace em-dash / en-dash with regular hyphen
+        line = re.sub(r"\s*[—–]\s*", " - ", line)
         lines.append(line.strip())
 
     cleaned = "\n".join(lines).strip()
