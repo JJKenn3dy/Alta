@@ -21,7 +21,7 @@ INTRO_MARKER_KEY = "_intro_requested"
 IDENTITY_KEYS = {"name", "preferred_name", "gender", "pronouns", "nickname"}
 STYLE_KEYS = {"communication_style", "response_preference"}
 HIGH_PRIORITY_KEYS = IDENTITY_KEYS | STYLE_KEYS
-MEMORY_STORE_MIN_IMPORTANCE = 0.45
+MEMORY_STORE_MIN_IMPORTANCE = 0.3
 FACT_KEEP_PER_USER = 80
 FACT_CONTEXT_MIN_IMPORTANCE = 0.45
 CONTEXT_HISTORY_LIMIT = 30
@@ -1079,12 +1079,10 @@ def should_include_user_document(input_text: str, document_text: str) -> bool:
 
 def should_extract_user_facts(input_text: str) -> bool:
     normalized = " ".join((input_text or "").lower().split())
-    if len(normalized) < 10:
+    if len(normalized) < 6:
         return False
     if any(pattern.search(normalized) for pattern in EXPLICIT_PROFILE_PATTERNS):
         return True
-    if "?" in normalized:
-        return False
 
     first_person_markers = (
         "я ",
@@ -1095,6 +1093,8 @@ def should_extract_user_facts(input_text: str) -> bool:
         "моя ",
         "мои ",
         "для меня",
+        "меня зовут",
+        "мне ",
     )
     fact_markers = (
         "люблю",
@@ -1110,6 +1110,24 @@ def should_extract_user_facts(input_text: str) -> bool:
         "хочу",
         "не люблю",
         "не нравится",
+        "зовут",
+        "родом из",
+        "переехал",
+        "переехала",
+        "лет",
+        "года",
+        "год",
+        "из города",
+        "из москвы",
+        "из питера",
+        "играю в",
+        "слушаю",
+        "смотрю",
+        "читаю",
+        "пишу на",
+        "кодю на",
+        "программирую",
+        "ненавижу",
     )
     has_first_person = any(marker in normalized for marker in first_person_markers)
     has_fact_marker = any(marker in normalized for marker in fact_markers)
@@ -2427,6 +2445,33 @@ async def generate_simple_reply_fallback(
     return _shrink_reply_text(answer, limit=180)
 
 
+async def _build_extraction_text(db, chat_id: int, user_id: int, input_text: str) -> str:
+    """Build extraction input with recent dialogue context for better fact extraction."""
+    try:
+        recent = await db.get_last_messages(chat_id, 6, focus_user_id=None)
+    except Exception:
+        return input_text
+
+    # Take last few messages (excluding the current one which is input_text)
+    context_lines = []
+    for msg in recent[-5:]:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if not content:
+            continue
+        # Skip if this is the current message
+        if role == "user" and content.endswith(input_text):
+            continue
+        prefix = "Собеседник" if role == "user" else "Альта"
+        context_lines.append(f"{prefix}: {_fit_text(content, 200)}")
+
+    if not context_lines:
+        return input_text
+
+    context_block = "\n".join(context_lines[-4:])
+    return f"Контекст диалога:\n{context_block}\n\nТекущее сообщение пользователя:\n{input_text}"
+
+
 async def _background_extraction(
     llm,
     db,
@@ -2442,13 +2487,14 @@ async def _background_extraction(
 ):
     """Run memory/profile extraction and summary update in background after answer is sent."""
     try:
+        extraction_text = await _build_extraction_text(db, chat_id, user_id, input_text)
         extracted_memory_stats, extracted_profile_stats = await asyncio.gather(
             maybe_store_memories(
-                llm, db, chat_id, user_id, input_text,
+                llm, db, chat_id, user_id, extraction_text,
                 turn_id=turn_id, turn_metrics=turn_metrics,
             ),
             maybe_store_user_profile(
-                llm, db, chat_id, user_id, input_text,
+                llm, db, chat_id, user_id, extraction_text,
                 sender_username, sender_first_name,
                 turn_id=turn_id, turn_metrics=turn_metrics,
             ),
