@@ -3,7 +3,9 @@ import unittest
 
 from agent import (
     _looks_like_context_dependent_reply,
+    _looks_like_typo_correction,
     _remove_forbidden_self_reference,
+    build_implicit_reply_context_block,
     should_extract_user_facts,
     REPEAT_REWRITE_PROMPT,
     MAX_EDITOR_REPLY_CHARS,
@@ -46,6 +48,41 @@ class ContextDependentReplyTests(unittest.TestCase):
 
     def test_empty_is_not_context_dependent(self):
         self.assertFalse(_looks_like_context_dependent_reply(""))
+
+
+class TypoCorrectionTests(unittest.TestCase):
+    def test_asterisk_detected_as_correction(self):
+        """Asterisk is a standard typo correction marker."""
+        self.assertTrue(_looks_like_typo_correction("Шеф*"))
+        self.assertTrue(_looks_like_typo_correction("*шеф"))
+        self.assertTrue(_looks_like_typo_correction("слово*"))
+
+    def test_no_asterisk_not_correction(self):
+        self.assertFalse(_looks_like_typo_correction("просто текст"))
+        self.assertFalse(_looks_like_typo_correction(""))
+
+    def test_implicit_block_includes_user_prev_message(self):
+        """The implicit context should include the user's PREVIOUS message."""
+        history = [
+            {"role": "user", "content": "Кто такой шей"},
+            {"role": "assistant", "content": "Шей — это имя. Может, ты про кого-то конкретного?"},
+            {"role": "user", "content": "Шеф*"},
+        ]
+        block = build_implicit_reply_context_block(history, "Шеф*")
+        self.assertIn("исправление", block.lower())
+        self.assertIn("Кто такой шей", block)
+        self.assertIn("Шей — это имя", block)
+
+    def test_implicit_block_short_reply_includes_prev_user(self):
+        """Short context-dependent replies should also show prev user message."""
+        history = [
+            {"role": "user", "content": "Где ты живёшь?"},
+            {"role": "assistant", "content": "А ты откуда?"},
+            {"role": "user", "content": "Из Москвы"},
+        ]
+        block = build_implicit_reply_context_block(history, "Из Москвы")
+        self.assertIn("Где ты живёшь", block)
+        self.assertIn("А ты откуда", block)
 
 
 class FactExtractionTests(unittest.TestCase):

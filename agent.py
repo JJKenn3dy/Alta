@@ -461,8 +461,17 @@ def _looks_like_context_dependent_reply(text: str) -> bool:
     return True
 
 
+def _looks_like_typo_correction(text: str) -> bool:
+    """Detect asterisk-based typo corrections like 'Шеф*' or '*шеф'."""
+    value = str(text or "").strip()
+    if not value:
+        return False
+    return "*" in value and len(value) <= 48
+
+
 def build_implicit_reply_context_block(history: list[dict], input_text: str) -> str:
-    if not _looks_like_context_dependent_reply(input_text):
+    is_typo_correction = _looks_like_typo_correction(input_text)
+    if not is_typo_correction and not _looks_like_context_dependent_reply(input_text):
         return ""
     if len(history) < 2:
         return ""
@@ -474,16 +483,42 @@ def build_implicit_reply_context_block(history: list[dict], input_text: str) -> 
     if prev_message.get("role") != "assistant":
         return ""
 
-    prev_text = _fit_text(prev_message.get("content", ""), 300)
-    if not prev_text or "?" not in prev_text:
+    prev_bot_text = _fit_text(prev_message.get("content", ""), 300)
+
+    # Find the user's own previous message (before the bot reply)
+    prev_user_text = ""
+    for i in range(len(history) - 3, -1, -1):
+        if history[i].get("role") == "user":
+            prev_user_text = _fit_text(history[i].get("content", ""), 200)
+            break
+
+    if is_typo_correction:
+        parts = [
+            "Текущее сообщение содержит * — это исправление опечатки в предыдущем сообщении.",
+        ]
+        if prev_user_text:
+            parts.append(f"Исходное сообщение пользователя: {prev_user_text}")
+        if prev_bot_text:
+            parts.append(f"Ответ бота на исходное сообщение: {prev_bot_text}")
+        parts.append(
+            "Перечитай исходное сообщение с учётом исправления и ответь на ИСПРАВЛЕННЫЙ вариант."
+        )
+        return "\n".join(parts)
+
+    if not prev_bot_text:
         return ""
 
-    return (
-        "Текущее сообщение короткое и зависит от предыдущей реплики бота.\n"
-        f"Предыдущая реплика бота: {prev_text}\n"
-        "Считай текущее сообщение прежде всего ответом на этот вопрос или уточнением к нему, "
+    parts = [
+        "Текущее сообщение короткое и зависит от контекста предыдущих реплик.",
+    ]
+    if prev_user_text:
+        parts.append(f"Предыдущее сообщение пользователя: {prev_user_text}")
+    parts.append(f"Предыдущая реплика бота: {prev_bot_text}")
+    parts.append(
+        "Считай текущее сообщение прежде всего ответом, уточнением или продолжением этого диалога, "
         "а не новой отдельной темой."
-    ).strip()
+    )
+    return "\n".join(parts)
 
 
 def build_mention_only_block(mention_only: bool) -> str:
@@ -1824,6 +1859,18 @@ async def build_context(
     history = _merge_histories(focused_history, shared_history, plan.history_messages, plan.history_chars)
     prompt_history = [{"role": item["role"], "content": item["content"]} for item in history]
     implicit_reply_block = build_implicit_reply_context_block(prompt_history, input_text)
+
+    # Inject implicit context directly into the last user message so the model
+    # sees it right next to the short message, not buried in the system prompt.
+    if implicit_reply_block and prompt_history:
+        for i in range(len(prompt_history) - 1, -1, -1):
+            if prompt_history[i].get("role") == "user":
+                original_content = prompt_history[i]["content"]
+                prompt_history[i] = {
+                    "role": "user",
+                    "content": f"[контекст: {implicit_reply_block}]\n{original_content}",
+                }
+                break
 
     system_blocks = []
 
