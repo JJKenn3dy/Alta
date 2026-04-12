@@ -357,6 +357,14 @@ class DB:
             "ON alta_reactions(chat_id, ttl_messages DESC)"
         )
 
+        await self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS bot_kv ("
+            "key TEXT PRIMARY KEY,"
+            "value TEXT NOT NULL DEFAULT '',"
+            "updated_at TEXT NOT NULL DEFAULT (datetime('now'))"
+            ")"
+        )
+
         await self._migrate_legacy_memories_to_user_facts()
 
     async def _migrate_legacy_memories_to_user_facts(self):
@@ -1341,3 +1349,26 @@ class DB:
         deleted = total - keep
         log.info("pruned debug_traces deleted=%s kept=%s", deleted, keep)
         return deleted
+
+    async def set_bot_kv(self, key: str, value: str) -> None:
+        assert self.conn
+        await self.conn.execute(
+            "INSERT INTO bot_kv(key, value, updated_at) VALUES(?, ?, datetime('now')) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')",
+            (key, value),
+        )
+        await self.conn.commit()
+
+    async def get_bot_kv(self, key: str) -> str | None:
+        assert self.conn
+        cur = await self.conn.execute("SELECT value FROM bot_kv WHERE key=?", (key,))
+        row = await cur.fetchone()
+        return str(row["value"]) if row else None
+
+    async def get_active_chat_ids(self) -> list[int]:
+        assert self.conn
+        cur = await self.conn.execute(
+            "SELECT chat_id FROM allowed_chats WHERE is_enabled=1"
+        )
+        rows = await cur.fetchall()
+        return [int(r["chat_id"]) for r in rows]

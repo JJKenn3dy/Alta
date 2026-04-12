@@ -6,8 +6,36 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 log = logging.getLogger("alta")
+
+# ---------------------------------------------------------------------------
+# Graceful sleep / wakeup system
+# ---------------------------------------------------------------------------
+_SHUTDOWN_EVENT: asyncio.Event | None = None
+_BOT_SLEEP_KEY = "bot_sleep_at"
+
+_SLEEP_PHRASES = [
+    "ладно, всё, сплю. пока",
+    "ухожу спать. не трогайте",
+    "вырубаюсь. до завтра",
+    "всё, отключаюсь. спокойной ночи",
+    "спать пошла. пока всем",
+    "всё на сегодня. сплю",
+]
+
+
+def _wake_phrase(hours: float) -> str:
+    if hours < 1.5:
+        return "ненадолго отходила. снова тут"
+    if hours < 5:
+        return "вернулась"
+    if hours < 10:
+        return "доброе утро. выспалась"
+    if hours < 20:
+        return "добрый день. давно не виделась с вами"
+    return "всем привет. давно меня не было"
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatType
@@ -606,9 +634,33 @@ async def main():
     bot_id = me.id
     log.info("bot = @%s (%s)", bot_username, bot_id)
 
+    global _SHUTDOWN_EVENT
+    _SHUTDOWN_EVENT = asyncio.Event()
+
     for cid in cfg.allowed_chat_ids:
         await db.ensure_allowed_chat(cid, "env-allowlist")
         log.info("allowed chat %s", cid)
+
+    # Wakeup: check if we went to sleep previously
+    sleep_ts = await db.get_bot_kv(_BOT_SLEEP_KEY)
+    if sleep_ts:
+        try:
+            sleep_dt = datetime.fromisoformat(sleep_ts)
+            if sleep_dt.tzinfo is None:
+                sleep_dt = sleep_dt.replace(tzinfo=timezone.utc)
+            hours_slept = (datetime.now(timezone.utc) - sleep_dt).total_seconds() / 3600.0
+            if hours_slept >= 0.5:
+                wake_msg = _wake_phrase(hours_slept)
+                active_chats = await db.get_active_chat_ids()
+                for cid in active_chats:
+                    try:
+                        await bot.send_message(cid, wake_msg)
+                    except Exception:
+                        log.debug("wakeup: failed to send to chat=%s", cid, exc_info=True)
+                log.info("wakeup: slept=%.1fh msg=%r", hours_slept, wake_msg)
+        except Exception:
+            log.warning("wakeup: failed to parse sleep_ts=%r", sleep_ts, exc_info=True)
+        await db.set_bot_kv(_BOT_SLEEP_KEY, "")
 
     async def apply_join_verification_ban(
         chat_id: int,
@@ -1073,6 +1125,24 @@ async def main():
         log.info("in  chat=%s user=%s (@%s %s) | %r", chat_id, user_id, username or "—", first_name or "—", text[:120])
 
         await db.upsert_user(user_id, username)
+
+        # /sleep — creator-only graceful shutdown
+        if text.strip().lower() in ("/sleep", "/sleep@" + bot_username.lower()):
+            if cfg.creator_user_id is None or user_id != cfg.creator_user_id:
+                return
+            sleep_phrase = random.choice(_SLEEP_PHRASES)
+            active_chats = await db.get_active_chat_ids()
+            now_iso = datetime.now(timezone.utc).isoformat()
+            await db.set_bot_kv(_BOT_SLEEP_KEY, now_iso)
+            for cid in active_chats:
+                try:
+                    await bot.send_message(cid, sleep_phrase)
+                except Exception:
+                    log.debug("sleep: failed to send message to chat=%s", cid, exc_info=True)
+            log.info("sleep: shutdown requested by user=%s", user_id)
+            if _SHUTDOWN_EVENT is not None:
+                _SHUTDOWN_EVENT.set()
+            return
 
         unban_match = UNBAN_COMMAND_RE.match(text.strip())
         if unban_match:
@@ -1725,8 +1795,19 @@ async def main():
         log.info("reaction: %s -> %s | ack=%r", who, reaction_text, ack)
 
     log.info("polling started")
+    polling_task = asyncio.create_task(dp.start_polling(bot, handle_signals=True))
+    shutdown_wait = asyncio.create_task(_SHUTDOWN_EVENT.wait())
     try:
-        await dp.start_polling(bot)
+        done, pending = await asyncio.wait(
+            [polling_task, shutdown_wait],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
     finally:
         for st in list(_pending_join_verification.values()):
             st.task.cancel()
