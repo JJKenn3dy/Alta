@@ -499,8 +499,15 @@ async def import_from_groups(db: Any, user_id: int) -> int:
     kwargs: dict[str, Any] = {}
 
     # Column fields — only set if private profile doesn't already have a value
-    for field in ("approved_display_name", "display_name", "nickname", "gender",
-                  "interests", "communication_style", "response_preference", "relationship_notes"):
+    for field in (
+        "approved_display_name",
+        "display_name",
+        "nickname",
+        "gender",
+        "interests",
+        "communication_style",
+        "response_preference",
+    ):
         group_val = (group_profile.get(field) or "").strip()
         private_val = (private_profile.get(field) or "").strip()
         if group_val and not private_val:

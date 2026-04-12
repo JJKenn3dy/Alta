@@ -11,27 +11,31 @@ Alta (Альта) — Telegram-бот с характером. Это не ас�
 ```
 Telegram (aiogram)
        |
-   main.py          — точка входа, Dispatcher, обработка сообщений/реакций/верификации/ЛС
+   main.py              — точка входа, Dispatcher, обработка сообщений/реакций/верификации/ЛС
        |
-   agent.py          — ядро: сборка контекста, генерация ответа, память, профили, repeat guard
+   agent.py             — оркестратор: re-export из суб-модулей, run_agent() точка входа
        |
-   +-- llm.py        — обертка над OpenAI-compatible API (retry, overflow protection)
-   +-- db.py          — SQLite через aiosqlite (сообщения, память, профили, факты, контекст-файлы)
-   +-- prompts.py     — системный промпт персонажа
-   +-- voice.py       — TTS через ElevenLabs API
-   +-- media.py       — стикеры/кастомные эмодзи: каталог, LLM-выбор, отправка
-   +-- file_context.py — RAG-lite: индексация knowledge-файлов, chunk scoring, retrieval
-   +-- lore_context.py — загрузка лора персонажа из файла
-   +-- profile_context.py — загрузка JSON-профиля создателя
-   +-- user_profile.py — команда /profile: парсинг, валидация, CRUD полей профиля
-   +-- private_profile.py — личный кабинет в ЛС: inline-меню, валидация, импорт из групп
-   +-- router.py       — простой роутер: mention/reply detection + cooldown
-   +-- config.py       — загрузка конфига из .env
-   +-- telemetry.py    — JSONL-логирование метрик каждого turn'а
-   +-- runtime_io.py   — UTF-8 reconfigure для Windows stdout/stderr
+   +-- context_builder.py   — сборка системного промпта, история, состояние Альты (mood)
+   +-- generation_pipeline.py — LLM генерация, web search, repeat rewrite, edit_answer
+   +-- memory_engine.py     — факты, профили, summary, background extraction
+   +-- postprocessing.py    — очистка ответа, repeat guard, gender fix, shrink
+   +-- llm.py               — обертка над OpenAI-compatible API (retry, overflow protection)
+   +-- db.py                — SQLite через aiosqlite (все таблицы и CRUD)
+   +-- prompts.py            — системный промпт персонажа
+   +-- voice.py             — TTS через ElevenLabs API
+   +-- media.py             — стикеры/кастомные эмодзи: каталог, LLM-выбор, отправка
+   +-- file_context.py      — RAG-lite: индексация knowledge-файлов, chunk scoring, retrieval
+   +-- lore_context.py      — helper для загрузки лора из файла (legacy, сейчас основной путь через file_context.py)
+   +-- profile_context.py   — загрузка JSON-профиля создателя
+   +-- user_profile.py      — команда /profile: парсинг, валидация, CRUD полей профиля
+   +-- private_profile.py   — личный кабинет в ЛС: inline-меню, валидация, импорт из групп
+   +-- router.py            — простой роутер: mention/reply detection + cooldown
+   +-- config.py            — загрузка конфига из .env
+   +-- telemetry.py         — JSONL-логирование метрик каждого turn'а
+   +-- runtime_io.py        — UTF-8 reconfigure для Windows stdout/stderr
 
 knowledge/           — текстовые файлы лора и контекста (автоиндексация)
-scripts/             — утилиты (init_db, build_media_catalog, analyze logs, debug dashboard)
+scripts/             — утилиты (init_db, build_media_catalog, analyze logs, debug dashboard, simulate_chat)
 tests/               — unit-тесты (pytest)
 ```
 
@@ -65,6 +69,12 @@ tests/               — unit-тесты (pytest)
         * file_context/RAG (релевантные куски из knowledge/)
         * lore (бэкграунд персонажа)
         * creator_profile (профиль создателя)
+        * alta_state (внутреннее состояние — тон, настроение, реакция)
+      - build_context() также обновляет mood state (детерминированно, без LLM):
+        * читает alta_chat_state + alta_user_relation из DB
+        * применяет временное затухание
+        * вычисляет новые значения по сигналам из входящего текста
+        * сохраняет обратно в DB, добавляет краткоживущую реакцию если нужно
       - _compose_system_prompt() — финальная склейка
       - llm.chat() — вызов LLM
       - 4 уровня fallback при context overflow: full -> compact -> minimal -> emergency
@@ -112,20 +122,49 @@ tests/               — unit-тесты (pytest)
 - **`/profile` команда** — делегируется в `user_profile.py`
 
 ### `agent.py`
-Ядро интеллекта. Самый большой и важный файл:
+Тонкий оркестратор. Содержит только `run_agent()` и re-export всех публичных символов из суб-модулей — для обратной совместимости с `main.py`.
 
-- **Context planning** — `ContextPlan` dataclass определяет 4 плана (full/compact/minimal/emergency) с разными бюджетами на историю, память, RAG, токены
-- **`build_context()`** — собирает все блоки системного промпта, использует `get_user_profile_merged()` для смешанного профиля
-- **`_generate_answer_with_fallback()`** — попытка сгенерировать ответ с постепенным уменьшением контекста при overflow
-- **`_deterministic_postprocess_answer()`** — детерминистическая постобработка (эмодзи, списки, self-reference, gender fix, длина)
+### `context_builder.py`
+Сборка контекста для LLM. Ключевые функции:
+
+- **`build_context()`** — главная функция: собирает все system_blocks, историю, обновляет mood state
+- **`_build_context_plans()`** — 4 плана (full/compact/minimal/emergency) с разными бюджетами
+- **`build_identity_block()`** — блок профиля собеседника
+- **`build_current_speaker_block()`** — блок текущего отправителя (speaker guard)
+- **`build_chat_participants_block()`** — блок других участников чата
+- **`build_reply_context_block()`** / **`build_implicit_reply_context_block()`** — контекст ответа на сообщение
+- **Mood system** (детерминированная, без LLM):
+  - `compute_state_updates()` — вычисляет изменения состояния по сигналам из текста
+  - `apply_time_decay_chat()` / `apply_time_decay_relation()` — временное затухание
+  - `build_alta_state_block()` — форматирует состояние в компактный блок для промпта
+
+### `generation_pipeline.py`
+LLM-генерация ответа:
+
+- **`_generate_answer_with_fallback()`** — главный цикл: попытка с 4 уровнями контекста при overflow
+- **`_compose_system_prompt()`** — склейка system_blocks в финальный промпт
+- **`edit_answer()`** — постредактирование через LLM при нарушениях стиля
+- **`generate_simple_reply_fallback()`** — аварийная генерация без контекста
+- **`_rewrite_repeated_reply()`** — перегенерация при повторе ответа
+- **Web search**: `_answer_defers_web_lookup()`, `_pick_web_search_query()`, `_should_force_web_fallback()`
+
+### `memory_engine.py`
+Факты, профили, summary:
+
+- **`maybe_store_memories()`** — LLM извлекает факты, сохраняет в `user_facts`
+- **`maybe_store_user_profile()`** — LLM обновляет профиль (interests, style). `relationship_notes` **не** обновляется автоматически
+- **`maybe_update_summary()`** — периодическое сжатие истории (каждые N сообщений)
+- **`_build_extraction_text()`** — формирует текст для экстракции с разметкой по владельцу (`Пользователь` / `Другой участник чата` / `Альта`)
+- **`format_user_facts()`** — форматирование фактов для промпта
+- **`sync_user_document()`** / **`build_user_document_payload()`** — досье пользователя
+
+### `postprocessing.py`
+Постобработка ответа:
+
+- **`_deterministic_postprocess_answer()`** — главная функция: эмодзи, списки, self-reference, gender fix, длина
 - **`_fix_gender()`** — замена мужского рода на женский ("я понял" -> "я поняла")
-- **Repeat guard** — `_is_repeated_recent_reply()`, `_rewrite_repeated_reply()`, `_repeat_guard_hard_fallback()`
-- **`_build_extraction_text()`** — формирует контекст для экстракции, явно размечая сообщения по владельцу (`Пользователь` / `Другой участник чата` / `Альта`), чтобы LLM не путал факты разных людей
-- **`maybe_store_memories()`** — LLM извлекает факты из сообщений, сохраняет в `user_facts`; не записывает факты третьих лиц
-- **`maybe_store_user_profile()`** — LLM обновляет профиль (interests, communication_style, response_preference). `relationship_notes` **не** обновляется автоматически — только вручную
-- **Summary update** — `maybe_update_summary()`: периодическое сжатие истории (каждые N сообщений)
-- **User document** — `build_user_document_payload()`, `render_user_document_text()`: досье пользователя из фактов + профиля
-- **`run_agent()`** — главная функция, оркестрирует весь pipeline
+- **`_is_repeated_recent_reply()`** / **`_repeat_guard_hard_fallback()`** — защита от повторов
+- **`_fit_text()`** / **`_clip_text()`** — обрезка текста с учётом предложений
 
 ### `llm.py`
 OpenAI-compatible API клиент:
@@ -134,7 +173,7 @@ OpenAI-compatible API клиент:
 - **`chat()`** — основной метод: retry с exponential backoff (до 7 попыток), context overflow detection, телеметрия
 - **`_ensure_context_budget()`** — pre-flight проверка размера контекста перед вызовом API
 - **`ContextOverflowError`** — кастомное исключение для переполнения контекста
-- **`estimate_chat_tokens()`** — эвристическая оценка токенов (chars / 2.0)
+- **`estimate_chat_tokens()`** — эвристическая оценка токенов (chars / 3.2)
 
 ### `db.py`
 SQLite storage через aiosqlite. Таблицы:
@@ -154,6 +193,9 @@ SQLite storage через aiosqlite. Таблицы:
 | `debug_traces` | Debug-трейсы turn'ов |
 | `cooldown_state` | Персистентные cooldown'ы |
 | `context_files` + `context_chunks` | Индекс knowledge-файлов и их чанков |
+| `alta_chat_state` | Состояние Альты в чате (energy, irritation, playfulness, social_battery) |
+| `alta_user_relation` | Отношение к пользователю (trust, warmth, caution, annoyance, interaction_count) |
+| `alta_reactions` | Краткоживущие реакции с TTL (reaction_kind, reaction_strength, ttl_messages) |
 
 Ключевые методы:
 - `get_last_messages()` — история с опциональной фокусировкой на конкретном пользователе
@@ -162,9 +204,12 @@ SQLite storage через aiosqlite. Таблицы:
 - `get_user_profile_merged(chat_id, user_id)` — слияние группового + приватного профиля; приватный (user-set) имеет приоритет
 - `get_all_group_profiles_merged(user_id)` — слияние профилей из всех групп для данного пользователя (используется при импорте)
 - `count_user_facts_global(user_id)` — количество фактов по всем групповым чатам
-- `upsert_user_fact()` — upsert с MAX(confidence, importance) при конфликте
+- `upsert_user_fact()` — upsert с заменой confidence/importance на новые значения при конфликте
 - `prune_user_facts()` — обрезка до лимита по importance/confidence
 - `rotate_messages()` — ротация старых сообщений (keep=2000)
+- `get_alta_chat_state()` / `save_alta_chat_state()` — mood: фон чата
+- `get_alta_user_relation()` / `save_alta_user_relation()` — mood: отношение к пользователю
+- `add_alta_reaction()` / `tick_alta_reactions()` / `get_active_alta_reaction()` — краткоживущие реакции
 - Auto-migration: `_migrate_schema()` добавляет новые колонки/таблицы автоматически
 
 ### `voice.py`
@@ -197,7 +242,7 @@ RAG-lite система для knowledge-файлов:
 - **`build_file_context_block()`** — форматирование snippets для промпта (lore vs обычные файлы)
 
 ### `lore_context.py`
-Загрузка текстового файла с бэкграундом персонажа (кэширование по mtime).
+Legacy-helper для загрузки текстового лора с кэшированием по mtime. В текущем рантайм-пайплайне основной источник лора — `file_context.py` (RAG по `knowledge/lore_*`).
 
 ### `profile_context.py`
 Загрузка JSON-профиля создателя (Захара) и форматирование в системный блок.
@@ -228,7 +273,7 @@ RAG-lite система для knowledge-файлов:
   - ✓ = уже в приватном профиле
   - → = будет добавлено при импорте
 - **`import_from_groups(db, user_id)`** — копирует поля из групповых профилей в приватный, не перезаписывая уже заданные вручную значения
-- `relationship_notes` исключён из импорта — авто-значения этого поля склонны быть транзиентными ("доверяет собеседнику на текущий момент") и вводить в заблуждение
+- `relationship_notes` исключён из импорта — авто-значения этого поля склонны быть транзиентными
 
 ### `router.py`
 Простой роутер (legacy, частично заменен логикой в main.py):
@@ -247,15 +292,17 @@ RAG-lite система для knowledge-файлов:
 | `LLM_API_KEY` | API key для LLM | `local-llm` |
 | `LLM_MODEL` | Модель LLM | `Mistral-Small-3.2-24B-Instruct-2506-UD-Q4_K_XL.gguf` |
 | `LLM_CONTEXT_WINDOW` | Размер контекстного окна | 12000 |
+| `LLM_CONTEXT_SAFETY_MARGIN` | Резерв токенов для защиты от overflow | 512 |
 | `DB_PATH` | Путь к SQLite | `./alta_tg_test.db` |
 | `HISTORY_LIMIT` | Лимит сообщений в истории | 40 |
 | `TEMPERATURE` | Температура LLM | 0.35 |
-| `MAX_TOKENS` | Макс. токенов в ответе | 200 |
+| `TOP_P` | Top-p sampling | 0.85 |
+| `MAX_TOKENS` | Макс. токенов в ответе | 350 |
 | `USER_COOLDOWN_SEC` | Cooldown между ответами | 15 |
 | `CREATOR_USER_ID` | Telegram ID создателя | — |
 | `ELEVENLABS_API_KEY` | API key для TTS | — |
 | `ELEVENLABS_VOICE_ID` | Voice ID для TTS | — |
-| `VOICE_REPLY_PROB` | Вероятность голосового ответа | 0.18 |
+| `VOICE_REPLY_PROB` | Вероятность голосового ответа | 0 |
 | `MEDIA_REPLY_PROB` | Вероятность стикера после ответа | 0.22 |
 | `KNOWLEDGE_DIR` | Директория с knowledge-файлами | `./knowledge` |
 
@@ -323,6 +370,51 @@ Reconfigure stdout/stderr в UTF-8 для Windows.
 
 ---
 
+## Система внутреннего состояния Альты (mood system)
+
+Детерминированная система без отдельных LLM-вызовов. Реализована в `context_builder.py`, данные в SQLite.
+
+### Три уровня состояния
+
+**Состояние чата** (`alta_chat_state`, per chat_id):
+- `energy` — общая энергия (0–1, базовое 0.7)
+- `irritation` — раздражённость (0–1)
+- `playfulness` — игривость (0–1, базовое 0.5)
+- `social_battery` — заряд социальной батареи (0–1, базовое 0.8)
+
+**Отношение к пользователю** (`alta_user_relation`, per chat_id+user_id):
+- `trust` — доверие (0–1, базовое 0.5)
+- `warmth` — теплота (0–1, базовое 0.5)
+- `caution` — осторожность (0–1)
+- `annoyance` — раздражение конкретным человеком (0–1)
+- `interaction_count` — счётчик взаимодействий
+
+**Краткоживущие реакции** (`alta_reactions`, TTL 1–3 сообщения):
+- Виды: `amused`, `curious`, `annoyed`, `concerned`, `embarrassed`
+- Привязаны к конкретному пользователю (`target_user_id`)
+- Автоматически удаляются по истечении TTL
+
+### Сигналы
+
+| Сигнал | Паттерны | Эффект |
+|--------|----------|--------|
+| Агрессия | мат, оскорбления, "заткнись" | ↑ irritation, ↑ annoyance, ↓ energy, ↓ trust |
+| Благодарность | "спасибо", "thanks" | ↑ warmth, ↑ trust, реакция `amused` |
+| Творческий | вопросы, "объясни", "придумай" | ↑ playfulness, реакция `curious` |
+
+### Обновление на каждом ходу (build_context)
+1. Чтение состояния из DB
+2. Временное затухание: irritation/annoyance экспоненциально падают, energy/social_battery восстанавливаются
+3. Вычисление новых значений по сигналам входящего сообщения
+4. Сохранение в DB
+5. Добавление краткоживущей реакции (если нужно)
+6. Декремент TTL существующих реакций (tick)
+7. Форматирование в блок `[Твоё состояние — влияй на тон, не упоминай вслух]`
+
+Блок добавляется только если состояние отклоняется от нейтрального. Числа никогда не попадают в промпт — только человекочитаемые метки.
+
+---
+
 ## Anti-spam / Верификация
 
 При входе нового пользователя в чат:
@@ -353,6 +445,7 @@ Reconfigure stdout/stderr в UTF-8 для Windows.
 - **aiosqlite** — async SQLite
 - **openai** — OpenAI-compatible API client (для локальной LLM)
 - **python-dotenv** — загрузка .env
+- **requests + primp** — web search backends (Yandex API / Brave fallback)
 - **ElevenLabs API** — TTS (опционально)
 - **LLM**: любая OpenAI-compatible модель (по умолчанию Mistral Small через llama.cpp)
 
@@ -384,20 +477,24 @@ pytest tests/
 ```
 
 Тесты покрывают:
-- `test_agent_history.py` — сборка и обрезка истории
-- `test_agent_memory.py` — извлечение и хранение фактов
-- `test_agent_repeat_guard.py` — защита от повторений
-- `test_agent_current_datetime.py` — текущая дата/время в контексте
+- `test_agent_current_datetime.py` — детерминированные ответы по текущей дате/времени
+- `test_agent_repeat_guard.py` — защита от повторов
 - `test_agent_summary_interval.py` — периодичность обновления summary
-- `test_agent_web_search_safety.py` — безопасность веб-поиска
-- `test_db_migration.py` — миграции схемы
-- `test_db_user_profiles.py` — профили пользователей
+- `test_agent_web_search_safety.py` — безопасный веб-поиск
+- `test_context_flirt_policy.py` — политика флирта/исключения
+- `test_db_migration.py` — миграции схемы БД
+- `test_db_user_profiles.py` — профильные CRUD/merge кейсы
+- `test_fixes.py` — регрессии по критическим фиксам
 - `test_llm_overflow.py` — обработка context overflow
 - `test_main_daily_promo.py` — промо-функционал
-- `test_main_join_verification.py` — антибот верификация
+- `test_main_join_verification.py` — anti-spam / join verification
 - `test_main_moderation_commands.py` — команды модерации
-- `test_main_sanitize.py` — санитизация текста
-- `test_main_unban.py` — разбан
-- `test_search_relevance.py` — поиск: релевантность
-- `test_search_routing.py` — поиск: маршрутизация
-- `test_user_profile_commands.py` — команда /profile
+- `test_main_sanitize.py` — санитизация входа/выхода
+- `test_main_unban.py` — разбан пользователей
+- `test_memory_extraction_text.py` — разметка extraction-контекста по владельцу сообщений
+- `test_mood.py` — mood system (state update, decay, prompt block, DB CRUD)
+- `test_private_profile_import.py` — импорт профиля из групп в ЛС-профиль
+- `test_search_relevance.py` — релевантность поиска
+- `test_search_routing.py` — маршрутизация веб-поиска
+- `test_stress.py` — нагрузочные/оценочные сценарии
+- `test_user_profile_commands.py` — команда `/profile`

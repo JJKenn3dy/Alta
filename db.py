@@ -316,6 +316,47 @@ class DB:
             "CREATE INDEX IF NOT EXISTS idx_pending_name_approvals_chat_status "
             "ON pending_name_approvals(chat_id, status, updated_at DESC)"
         )
+
+        # Alta internal state tables
+        await self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS alta_chat_state ("
+            "chat_id INTEGER PRIMARY KEY,"
+            "energy REAL NOT NULL DEFAULT 0.7,"
+            "irritation REAL NOT NULL DEFAULT 0.0,"
+            "playfulness REAL NOT NULL DEFAULT 0.5,"
+            "social_battery REAL NOT NULL DEFAULT 0.8,"
+            "updated_at TEXT NOT NULL DEFAULT (datetime('now'))"
+            ")"
+        )
+        await self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS alta_user_relation ("
+            "chat_id INTEGER NOT NULL,"
+            "user_id INTEGER NOT NULL,"
+            "trust REAL NOT NULL DEFAULT 0.5,"
+            "warmth REAL NOT NULL DEFAULT 0.5,"
+            "caution REAL NOT NULL DEFAULT 0.0,"
+            "annoyance REAL NOT NULL DEFAULT 0.0,"
+            "interaction_count INTEGER NOT NULL DEFAULT 0,"
+            "updated_at TEXT NOT NULL DEFAULT (datetime('now')),"
+            "PRIMARY KEY (chat_id, user_id)"
+            ")"
+        )
+        await self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS alta_reactions ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "chat_id INTEGER NOT NULL,"
+            "reaction_kind TEXT NOT NULL,"
+            "reaction_strength REAL NOT NULL DEFAULT 0.5,"
+            "ttl_messages INTEGER NOT NULL DEFAULT 2,"
+            "target_user_id INTEGER,"
+            "created_at TEXT NOT NULL DEFAULT (datetime('now'))"
+            ")"
+        )
+        await self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_alta_reactions_chat "
+            "ON alta_reactions(chat_id, ttl_messages DESC)"
+        )
+
         await self._migrate_legacy_memories_to_user_facts()
 
     async def _migrate_legacy_memories_to_user_facts(self):
@@ -1159,6 +1200,128 @@ class DB:
         deleted = total - keep
         log.info("rotated messages chat_id=%s deleted=%s kept=%s", chat_id, deleted, keep)
         return deleted
+
+    # ------------------------------------------------------------------
+    # Alta internal state: chat mood, user relations, short-lived reactions
+    # ------------------------------------------------------------------
+
+    async def get_alta_chat_state(self, chat_id: int) -> dict:
+        assert self.conn
+        cur = await self.conn.execute(
+            "SELECT energy,irritation,playfulness,social_battery,updated_at "
+            "FROM alta_chat_state WHERE chat_id=?",
+            (chat_id,),
+        )
+        row = await cur.fetchone()
+        if row:
+            return dict(row)
+        return {
+            "energy": 0.7, "irritation": 0.0,
+            "playfulness": 0.5, "social_battery": 0.8,
+            "updated_at": "",
+        }
+
+    async def save_alta_chat_state(
+        self, chat_id: int,
+        energy: float, irritation: float,
+        playfulness: float, social_battery: float,
+    ) -> None:
+        assert self.conn
+        await self.conn.execute(
+            "INSERT INTO alta_chat_state(chat_id,energy,irritation,playfulness,social_battery) "
+            "VALUES(?,?,?,?,?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET "
+            "energy=excluded.energy,irritation=excluded.irritation,"
+            "playfulness=excluded.playfulness,social_battery=excluded.social_battery,"
+            "updated_at=datetime('now')",
+            (chat_id, energy, irritation, playfulness, social_battery),
+        )
+        await self.conn.commit()
+
+    async def get_alta_user_relation(self, chat_id: int, user_id: int) -> dict:
+        assert self.conn
+        cur = await self.conn.execute(
+            "SELECT trust,warmth,caution,annoyance,interaction_count,updated_at "
+            "FROM alta_user_relation WHERE chat_id=? AND user_id=?",
+            (chat_id, user_id),
+        )
+        row = await cur.fetchone()
+        if row:
+            return dict(row)
+        return {
+            "trust": 0.5, "warmth": 0.5, "caution": 0.0,
+            "annoyance": 0.0, "interaction_count": 0, "updated_at": "",
+        }
+
+    async def save_alta_user_relation(
+        self, chat_id: int, user_id: int,
+        trust: float, warmth: float, caution: float,
+        annoyance: float, interaction_count: int,
+    ) -> None:
+        assert self.conn
+        await self.conn.execute(
+            "INSERT INTO alta_user_relation"
+            "(chat_id,user_id,trust,warmth,caution,annoyance,interaction_count) "
+            "VALUES(?,?,?,?,?,?,?) "
+            "ON CONFLICT(chat_id,user_id) DO UPDATE SET "
+            "trust=excluded.trust,warmth=excluded.warmth,caution=excluded.caution,"
+            "annoyance=excluded.annoyance,interaction_count=excluded.interaction_count,"
+            "updated_at=datetime('now')",
+            (chat_id, user_id, trust, warmth, caution, annoyance, interaction_count),
+        )
+        await self.conn.commit()
+
+    async def get_active_alta_reaction(
+        self, chat_id: int, target_user_id: int | None = None
+    ) -> dict | None:
+        assert self.conn
+        if target_user_id is not None:
+            cur = await self.conn.execute(
+                "SELECT id,reaction_kind,reaction_strength,ttl_messages,target_user_id "
+                "FROM alta_reactions "
+                "WHERE chat_id=? AND ttl_messages > 0 "
+                "AND (target_user_id=? OR target_user_id IS NULL) "
+                "ORDER BY reaction_strength DESC LIMIT 1",
+                (chat_id, target_user_id),
+            )
+        else:
+            cur = await self.conn.execute(
+                "SELECT id,reaction_kind,reaction_strength,ttl_messages,target_user_id "
+                "FROM alta_reactions "
+                "WHERE chat_id=? AND ttl_messages > 0 "
+                "ORDER BY reaction_strength DESC LIMIT 1",
+                (chat_id,),
+            )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def add_alta_reaction(
+        self, chat_id: int, reaction_kind: str,
+        reaction_strength: float, ttl_messages: int,
+        target_user_id: int | None = None,
+    ) -> None:
+        assert self.conn
+        await self.conn.execute(
+            "INSERT INTO alta_reactions"
+            "(chat_id,reaction_kind,reaction_strength,ttl_messages,target_user_id) "
+            "VALUES(?,?,?,?,?)",
+            (chat_id, reaction_kind, reaction_strength, ttl_messages, target_user_id),
+        )
+        await self.conn.commit()
+
+    async def tick_alta_reactions(self, chat_id: int) -> None:
+        """Decrement TTL of all active reactions, delete expired ones."""
+        assert self.conn
+        await self.conn.execute(
+            "UPDATE alta_reactions SET ttl_messages=ttl_messages-1 "
+            "WHERE chat_id=? AND ttl_messages > 0",
+            (chat_id,),
+        )
+        await self.conn.execute(
+            "DELETE FROM alta_reactions WHERE chat_id=? AND ttl_messages <= 0",
+            (chat_id,),
+        )
+        await self.conn.commit()
 
     async def prune_debug_traces(self, keep: int = 500) -> int:
         """Delete oldest debug_traces, keeping the most recent *keep*."""

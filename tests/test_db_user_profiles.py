@@ -96,6 +96,46 @@ class DBUserProfileTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(count, 2)
 
+    async def test_private_profile_overrides_group_profile_in_merged_view(self):
+        path = self._make_db_path("profile_merge_priority")
+        user_id = 9001
+        chat_id = -100700
+        try:
+            db = DB(path)
+            await db.connect()
+            try:
+                await db.upsert_user_profile(
+                    chat_id,
+                    user_id,
+                    approved_display_name="АвтоИмя",
+                    display_name="АвтоИмя",
+                    interests="игры",
+                    communication_style="коротко",
+                    profile_confidence=0.4,
+                )
+                await db.upsert_user_profile(
+                    user_id,
+                    user_id,
+                    approved_display_name="РучноеИмя",
+                    display_name="РучноеИмя",
+                    communication_style="развёрнуто",
+                    profile_confidence=1.0,
+                )
+                merged = await db.get_user_profile_merged(chat_id, user_id)
+            finally:
+                await db.close()
+        finally:
+            for suffix in ("", "-wal", "-shm"):
+                candidate = f"{path}{suffix}"
+                if os.path.exists(candidate):
+                    os.remove(candidate)
+
+        self.assertEqual(merged.get("approved_display_name"), "РучноеИмя")
+        self.assertEqual(merged.get("display_name"), "РучноеИмя")
+        self.assertEqual(merged.get("communication_style"), "развёрнуто")
+        # Group-only field should still be visible when private profile doesn't set it.
+        self.assertEqual(merged.get("interests"), "игры")
+
 
 if __name__ == "__main__":
     unittest.main()

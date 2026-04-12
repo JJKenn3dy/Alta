@@ -1070,7 +1070,7 @@ async def main():
         username = message.from_user.username
         first_name = message.from_user.first_name
         text = message.text or ""
-        log.debug("in: chat=%s user=%s text=%r", chat_id, user_id, text)
+        log.info("in  chat=%s user=%s (@%s %s) | %r", chat_id, user_id, username or "—", first_name or "—", text[:120])
 
         await db.upsert_user(user_id, username)
 
@@ -1604,7 +1604,7 @@ async def main():
                 else:
                     await message.reply(answer)
                 await db.add_message(chat_id, bot_id, "assistant", answer, target_user_id=user_id)
-                log.debug("out: %r", answer)
+                log.info("out chat=%s user=%s | %r", chat_id, user_id, answer[:120])
 
                 if media_catalog.get("items") and await media_cooldown_ok(
                     db,
