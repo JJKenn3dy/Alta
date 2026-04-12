@@ -26,7 +26,8 @@ media.py          — стикеры/кастомные эмодзи (катал
 file_context.py   — RAG-lite: индексация knowledge/, chunk scoring, retrieval
 lore_context.py   — загрузка файла с бэкграундом персонажа
 profile_context.py — загрузка creator_profile.json
-user_profile.py   — /profile команда: парсинг, валидация, CRUD
+user_profile.py   — /profile команда: парсинг, валидация, CRUD полей профиля
+private_profile.py — личный кабинет в ЛС бота: inline-меню, валидация, импорт из групп
 router.py         — legacy роутер (mention/reply detection)
 telemetry.py      — JSONL логирование метрик в orchestration.log
 runtime_io.py     — UTF-8 reconfigure для Windows
@@ -49,6 +50,13 @@ tests/            — pytest тесты
 6. **Постобработка ответа**: `_deterministic_postprocess_answer()` — удаление эмодзи, списков, "я бот", fix пола (мужской→женский).
 
 7. **Санитизация**: `sanitize_incoming_text()` и `sanitize_outgoing_text()` защищают от prompt injection (удаление `[id=... @user]` тегов, `system:` / `assistant:` префиксов).
+
+8. **Двухуровневый профиль пользователя**:
+   - Групповой профиль `(chat_id, user_id)` — авто-собирается LLM из сообщений в группе
+   - Приватный профиль `(user_id, user_id)` — задаётся пользователем вручную через ЛС бота
+   - `get_user_profile_merged()` всегда возвращает слияние: приватный профиль имеет приоритет
+
+9. **Защита от загрязнения памяти**: в `_build_extraction_text()` сообщения других участников чата явно помечаются как "Другой участник чата" — LLM не может приписать их факты целевому пользователю.
 
 ## Как запускать
 
@@ -76,10 +84,37 @@ pytest tests/
 
 - `messages` — история (chat_id, user_id, role, text, target_user_id)
 - `user_facts` — факты о пользователях (fact_type, value, confidence, importance)
-- `user_profiles` — профили (display_name, gender, interests, communication_style)
+- `user_profiles` — профили (display_name, gender, interests, communication_style, extra_fields)
 - `chat_summary` / `user_chat_summaries` — сжатая история
 - `context_files` / `context_chunks` — индекс knowledge-файлов
 - `memories` — legacy память (мигрируется в user_facts)
+
+Профиль `user_profiles` хранит `extra_fields TEXT` — JSON с дополнительными полями (age, city, occupation, about).
+Приватный профиль пользователя хранится под ключом `chat_id = user_id` (ЛС бота).
+
+## Система профилей пользователя
+
+### Команда /profile (в групповых чатах)
+Команды: show, set, patch (bulk), delete, clear. Алиасы полей на русском и английском.
+
+### Личный кабинет в ЛС бота (private_profile.py)
+Пользователь пишет боту в личку → получает inline-меню без какого-либо LLM.
+- Поля: Имя, Ник, Пол, Возраст, Город, Занятие, Интересы, Стиль общения, Формат ответов, О себе
+- Пол: быстрый выбор кнопками (Мужской / Женский / Небинарный / Не указан / Своё)
+- Кнопка "📥 Что обо мне знает Альта" — показывает данные собранные из групп с разметкой ✓/→
+- Импорт не перезаписывает уже заданные вручную значения
+
+### Валидация в ЛС
+- Имя/Ник: макс. 40 симв., нет ссылок, нет HTML, нет /команд
+- Возраст: целое 10–120
+- Город/Занятие: макс. 60/100 симв., нет ссылок
+- Интересы/Стили: макс. 200 симв.
+- О себе: макс. 300 симв.
+- Rate limit: 30 сохранений/час на пользователя
+
+### Слияние профилей (get_user_profile_merged)
+Приватный профиль (user-set) всегда побеждает авто-собранный групповой.
+Групповой профиль заполняет только пустые поля приватного.
 
 ## Что НЕ трогать без понимания
 
@@ -87,3 +122,11 @@ pytest tests/
 - `_migrate_schema()` в db.py — автомиграции, добавлять новые в конец
 - `_fix_gender()` в agent.py — regex'ы для gender fix, ломаются при неаккуратном изменении
 - `_pending_join_verification` в main.py — in-memory state верификации, race conditions
+- `get_user_profile_merged()` в db.py — логика приоритета приватного профиля над групповым
+- `_build_extraction_text()` в agent.py — разметка сообщений по owner'у, нельзя смешивать
+
+## Известные ограничения / TODO
+
+- `relationship_notes` не извлекается автоматически (только вручную через /profile) — слишком склонно к записи транзиентных состояний
+- `_pending_join_verification` хранится только в памяти (теряется при рестарте)
+- `route_mode()` пока не влияет на контекстный бюджет

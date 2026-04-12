@@ -11,7 +11,7 @@ log = logging.getLogger("alta")
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatType
-from aiogram.types import BufferedInputFile, ChatPermissions, Message, MessageReactionUpdated
+from aiogram.types import BufferedInputFile, CallbackQuery, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageReactionUpdated
 
 from agent import ReplyContext, RouteTurn, route_mode, route_reason, run_agent
 from config import load_config
@@ -26,6 +26,36 @@ from media import (
 )
 from runtime_io import configure_stdio
 from telemetry import Telemetry
+from user_profile import (
+    apply_profile_updates,
+    cleared_profile,
+    delete_profile_field,
+    format_profile_view,
+    parse_profile_command,
+    serialize_profile_extra_fields,
+)
+from private_profile import (
+    FIELD_LABELS,
+    FIELD_PROMPTS,
+    build_back_to_edit_keyboard,
+    build_cancel_keyboard,
+    build_clear_confirm_keyboard,
+    build_edit_menu,
+    build_gender_menu,
+    build_import_confirm_keyboard,
+    build_import_preview_keyboard,
+    build_main_menu,
+    clear_all_fields,
+    clear_pm_state,
+    format_import_preview,
+    format_profile_private,
+    get_pm_state,
+    import_from_groups,
+    rate_limit_ok,
+    save_field,
+    set_pm_state,
+    validate_field,
+)
 from voice import ElevenLabsError, ElevenLabsTTS, detect_voice_request
 
 BOT_ALIASES = [
@@ -177,6 +207,7 @@ EMOJI_CHAR_RE = re.compile(
     "]+",
     flags=re.UNICODE,
 )
+PROFILE_COMMAND_DETECT_RE = re.compile(r"^/(?:profile|user_profile)(?:@\S+)?(?:\s|$)", re.IGNORECASE)
 NAME_REQUEST_COMMAND_RE = re.compile(r"^/(?:setname|set_name|callme)\s+(?P<name>.+)$", re.IGNORECASE)
 NAME_REQUEST_PATTERNS = (
     re.compile(r"^(?:зови|называй)\s+меня\s+(?P<name>.+)$", re.IGNORECASE),
@@ -561,6 +592,7 @@ async def main():
         cfg.voice_reply_max_chars,
         voice_tts.extension,
     )
+    log.info("background extraction enabled=%s", cfg.enable_background_extraction)
 
     media_catalog = await maybe_refresh_media_catalog(bot, cfg.media_catalog_path)
     log.info(
@@ -655,6 +687,206 @@ async def main():
             reason="timeout",
             join_message_id=state.join_message_id,
         )
+
+    # ------------------------------------------------------------------
+    # Private chat — profile settings (no LLM)
+    # ------------------------------------------------------------------
+
+    _PM_WELCOME = (
+        "Привет! Здесь ты можешь настроить свой профиль.\n"
+        "Альта использует эти данные чтобы лучше тебя понимать в чатах."
+    )
+
+    @dp.message(F.text & F.chat.func(lambda c: c.type == ChatType.PRIVATE))
+    async def on_private_message(message: Message):
+        if not message.from_user:
+            return
+        user_id = message.from_user.id
+        text = (message.text or "").strip()
+
+        # /cancel — cancel active editing
+        if text.lower() in ("/cancel", "/отмена"):
+            clear_pm_state(user_id)
+            await message.answer(
+                "Отменено.",
+                reply_markup=build_main_menu(),
+            )
+            return
+
+        # Check if user is in editing state
+        state = get_pm_state(user_id)
+        if state:
+            field = state["field"]
+            ok, error, cleaned = validate_field(field, text)
+            if not ok:
+                await message.answer(
+                    f"Ошибка: {error}\n\n{FIELD_PROMPTS.get(field, '')}",
+                    reply_markup=build_cancel_keyboard(),
+                )
+                return
+            if not rate_limit_ok(user_id):
+                await message.answer(
+                    "Слишком много изменений. Подожди немного.",
+                    reply_markup=build_main_menu(),
+                )
+                clear_pm_state(user_id)
+                return
+            await save_field(db, user_id, field, cleaned)
+            clear_pm_state(user_id)
+            label = FIELD_LABELS.get(field, field)
+            await message.answer(
+                f"✓ {label} сохранено: {cleaned}",
+                reply_markup=build_back_to_edit_keyboard(),
+            )
+            return
+
+        # /start or /profile — show main menu
+        if text.lower() in ("/start", "/profile", "/профиль"):
+            await message.answer(_PM_WELCOME, reply_markup=build_main_menu())
+            return
+
+        # Any other text — show main menu with hint
+        await message.answer(
+            "Используй кнопки для управления профилем.",
+            reply_markup=build_main_menu(),
+        )
+
+    @dp.callback_query(F.data.startswith("pm:"))
+    async def on_pm_callback(callback: CallbackQuery):
+        if not callback.from_user or not callback.message:
+            await callback.answer()
+            return
+        user_id = callback.from_user.id
+        data = callback.data or ""
+
+        # Helper — edit the message text+keyboard
+        async def edit(text: str, markup=None):
+            try:
+                await callback.message.edit_text(text, reply_markup=markup)
+            except Exception:
+                pass
+
+        if data == "pm:menu":
+            clear_pm_state(user_id)
+            await edit(_PM_WELCOME, build_main_menu())
+            await callback.answer()
+            return
+
+        if data == "pm:show":
+            profile = await db.get_user_profile(user_id, user_id)
+            text = format_profile_private(profile)
+            await edit(text, InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="← Назад", callback_data="pm:menu")],
+            ]))
+            await callback.answer()
+            return
+
+        if data == "pm:edit":
+            clear_pm_state(user_id)
+            await edit("Что хочешь изменить?", build_edit_menu())
+            await callback.answer()
+            return
+
+        if data == "pm:cancel":
+            clear_pm_state(user_id)
+            await edit(_PM_WELCOME, build_main_menu())
+            await callback.answer("Отменено.")
+            return
+
+        if data == "pm:clear_confirm":
+            await edit(
+                "Удалить все данные профиля? Это действие нельзя отменить.",
+                build_clear_confirm_keyboard(),
+            )
+            await callback.answer()
+            return
+
+        if data == "pm:clear_yes":
+            await clear_all_fields(db, user_id)
+            clear_pm_state(user_id)
+            await edit("Профиль очищен.", build_main_menu())
+            await callback.answer("Готово.")
+            return
+
+        # Gender quick-select
+        if data.startswith("pm:gender:"):
+            gender_value = data[len("pm:gender:"):]
+            if not rate_limit_ok(user_id):
+                await callback.answer("Слишком много изменений, подожди немного.")
+                return
+            await save_field(db, user_id, "gender", gender_value)
+            clear_pm_state(user_id)
+            await edit(f"✓ Пол сохранён: {gender_value}", build_back_to_edit_keyboard())
+            await callback.answer("Сохранено.")
+            return
+
+        # Field editing — gender has its own quick-select menu
+        if data == "pm:field:gender":
+            await edit("Выбери пол:", build_gender_menu())
+            await callback.answer()
+            return
+
+        # gender_custom — text input mode for gender
+        if data == "pm:field:gender_custom":
+            set_pm_state(user_id, "gender", menu_message_id=callback.message.message_id)
+            await edit(
+                "Введи свой вариант (макс. 30 символов):\n\nИли /cancel для отмены.",
+                build_cancel_keyboard(),
+            )
+            await callback.answer()
+            return
+
+        if data.startswith("pm:field:"):
+            field = data[len("pm:field:"):]
+            if field not in FIELD_PROMPTS:
+                await callback.answer("Неизвестное поле.")
+                return
+            set_pm_state(user_id, field, menu_message_id=callback.message.message_id)
+            await edit(FIELD_PROMPTS[field], build_cancel_keyboard())
+            await callback.answer()
+            return
+
+        # Import from group chats — preview
+        if data == "pm:import_preview":
+            group_profile = await db.get_all_group_profiles_merged(user_id)
+            private_profile = await db.get_user_profile(user_id, user_id)
+            facts_count = await db.count_user_facts_global(user_id)
+            text, has_importable = format_import_preview(group_profile, private_profile, facts_count)
+            await edit(text, build_import_preview_keyboard(has_importable))
+            await callback.answer()
+            return
+
+        # Import from group chats — confirmation step
+        if data == "pm:import_confirm":
+            group_profile = await db.get_all_group_profiles_merged(user_id)
+            private_profile = await db.get_user_profile(user_id, user_id)
+            facts_count = await db.count_user_facts_global(user_id)
+            text, has_importable = format_import_preview(group_profile, private_profile, facts_count)
+            if not has_importable:
+                await edit("Нечего переносить — всё уже в профиле.", build_main_menu())
+                await callback.answer()
+                return
+            confirm_text = text + "\n\nПеренести эти данные в твой профиль?"
+            await edit(confirm_text, build_import_confirm_keyboard())
+            await callback.answer()
+            return
+
+        # Import from group chats — execute
+        if data == "pm:import_do":
+            imported = await import_from_groups(db, user_id)
+            if imported:
+                await edit(
+                    f"Готово! Перенесено полей: {imported}.\n"
+                    "Ты можешь отредактировать любое поле через меню.",
+                    build_back_to_edit_keyboard(),
+                )
+                await callback.answer("Импортировано.")
+            else:
+                await edit("Нечего переносить — всё уже в профиле.", build_main_menu())
+                await callback.answer()
+            return
+
+        await callback.answer()
 
     @dp.message(F.new_chat_members)
     async def on_new_chat_members(message: Message):
@@ -897,6 +1129,88 @@ async def main():
             _cooldown_verification.pop((chat_id, target_id))
             await message.reply(f"Пользователь {target_id} разбанен.")
             log.info("unban: actor=%s target=%s chat=%s", user_id, target_id, chat_id)
+            return
+
+        # /profile command — self-service profile management
+        if PROFILE_COMMAND_DETECT_RE.match(text.strip()):
+            parsed = parse_profile_command(text.strip())
+            if parsed is None:
+                await message.reply("Используй /profile help чтобы узнать команды.")
+                return
+            action = parsed.get("action")
+            if action == "help":
+                from user_profile import PROFILE_HELP_TEXT
+                await message.reply(PROFILE_HELP_TEXT)
+                return
+            if action == "show":
+                profile = await db.get_user_profile(chat_id, user_id)
+                await message.reply(format_profile_view(profile))
+                return
+            if action == "clear":
+                cleared = cleared_profile()
+                await db.upsert_user_profile(
+                    chat_id, user_id,
+                    display_name=cleared.get("display_name"),
+                    nickname=cleared.get("nickname"),
+                    approved_display_name=cleared.get("approved_display_name"),
+                    gender=cleared.get("gender"),
+                    interests=cleared.get("interests", ""),
+                    communication_style=cleared.get("communication_style", ""),
+                    response_preference=cleared.get("response_preference", ""),
+                    relationship_notes=cleared.get("relationship_notes", ""),
+                    profile_confidence=cleared.get("profile_confidence", 0.0),
+                    extra_fields="{}",
+                )
+                await message.reply("Профиль очищен.")
+                return
+            if action == "patch":
+                updates = parsed.get("updates", [])
+                current = await db.get_user_profile(chat_id, user_id)
+                updated = apply_profile_updates(current, updates)
+                extra_json = serialize_profile_extra_fields(updated.get("extra_fields") or updated.get("extra_json"))
+                await db.upsert_user_profile(
+                    chat_id, user_id,
+                    display_name=updated.get("display_name"),
+                    nickname=updated.get("nickname"),
+                    approved_display_name=updated.get("approved_display_name"),
+                    gender=updated.get("gender"),
+                    interests=updated.get("interests", ""),
+                    communication_style=updated.get("communication_style", ""),
+                    response_preference=updated.get("response_preference", ""),
+                    relationship_notes=updated.get("relationship_notes", ""),
+                    profile_confidence=updated.get("profile_confidence", 1.0),
+                    extra_fields=extra_json,
+                )
+                labels = ", ".join(u["label"] for u in updates)
+                await message.reply(f"Обновлено: {labels}.")
+                return
+            if action == "delete":
+                field = parsed.get("field", "")
+                label = parsed.get("label", field)
+                current = await db.get_user_profile(chat_id, user_id)
+                updated = delete_profile_field(current, field)
+                extra_json = serialize_profile_extra_fields(updated.get("extra_fields") or updated.get("extra_json"))
+                await db.upsert_user_profile(
+                    chat_id, user_id,
+                    display_name=updated.get("display_name"),
+                    nickname=updated.get("nickname"),
+                    approved_display_name=updated.get("approved_display_name"),
+                    gender=updated.get("gender"),
+                    interests=updated.get("interests", ""),
+                    communication_style=updated.get("communication_style", ""),
+                    response_preference=updated.get("response_preference", ""),
+                    relationship_notes=updated.get("relationship_notes", ""),
+                    profile_confidence=updated.get("profile_confidence", 1.0),
+                    extra_fields=extra_json,
+                )
+                await message.reply(f"Поле «{label}» удалено.")
+                return
+            if action == "invalid":
+                err = parsed.get("error", "Неизвестная ошибка.")
+                help_text = parsed.get("help", "")
+                reply = err + ("\n\n" + help_text if help_text else "")
+                await message.reply(reply)
+                return
             return
 
         key = (chat_id, user_id)
@@ -1193,6 +1507,7 @@ async def main():
                             max_tokens=cfg.max_tokens,
                             history_limit=cfg.history_limit,
                             debug_traces=cfg.debug_traces,
+                            enable_background_extraction=cfg.enable_background_extraction,
                             creator_user_id=cfg.creator_user_id,
                             creator_profile_path=cfg.creator_profile_path,
                             sender_username=username,
@@ -1369,7 +1684,7 @@ async def main():
         if not reaction_ack_cooldown_ok(chat_id, user.id):
             return
 
-        base_prob = 0.18
+        base_prob = 0
         if any(x in {"❤️", "👍", "🔥", "😂", "😍"} for x in added):
             base_prob += 0.15
         if len(added) >= 2:

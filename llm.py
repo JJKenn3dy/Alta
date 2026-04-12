@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import math
+import re
 import time
 
 from openai import AsyncOpenAI
@@ -37,6 +38,46 @@ def _looks_like_context_overflow(error: Exception) -> bool:
         "kv cache",
     )
     return any(marker in text for marker in markers)
+
+
+def _looks_like_param_not_supported(error: Exception) -> bool:
+    text = str(error).lower()
+    markers = (
+        "frequency_penalty",
+        "presence_penalty",
+        "not supported",
+        "unsupported parameter",
+        "unknown field",
+        "extra inputs",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _looks_like_max_tokens_not_supported(error: Exception) -> bool:
+    text = str(error).lower()
+    return (
+        "max_tokens" in text
+        and "max_completion_tokens" in text
+        and ("not supported" in text or "unsupported parameter" in text)
+    )
+
+
+def _looks_like_max_completion_tokens_not_supported(error: Exception) -> bool:
+    text = str(error).lower()
+    return (
+        "max_completion_tokens" in text
+        and ("not supported" in text or "unsupported parameter" in text)
+    )
+
+
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_THINK_OPEN_RE = re.compile(r"<think>.*$", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_think_blocks(text: str) -> str:
+    text = _THINK_BLOCK_RE.sub("", text)
+    text = _THINK_OPEN_RE.sub("", text)
+    return text.strip()
 
 
 def _estimate_text_tokens(text: str) -> int:
@@ -105,6 +146,8 @@ class LLM:
     ) -> str:
         frequency_penalty = frequency_penalty if frequency_penalty is not None else self.frequency_penalty
         presence_penalty = presence_penalty if presence_penalty is not None else self.presence_penalty
+        penalty_params_disabled = False
+        token_limit_param = "max_tokens"
         last_err = None
         started_at = time.perf_counter()
         call_index = (len(turn_metrics.llm_calls) + 1) if turn_metrics is not None else 1
@@ -135,17 +178,19 @@ class LLM:
         for attempt in range(1, self.max_retries + 1):
             try:
                 self._ensure_context_budget(system_prompt, messages, max_tokens)
-                resp = await self.client.chat.completions.create(
+                create_kwargs: dict = dict(
                     model=self.model,
                     messages=[{"role": "system", "content": system_prompt}] + messages,
                     temperature=temperature,
                     top_p=top_p,
-                    max_tokens=max_tokens,
-                    frequency_penalty=frequency_penalty,
-                    presence_penalty=presence_penalty,
                     stream=False,
                 )
-                content = (resp.choices[0].message.content or "").strip()
+                create_kwargs[token_limit_param] = max_tokens
+                if not penalty_params_disabled:
+                    create_kwargs["frequency_penalty"] = frequency_penalty
+                    create_kwargs["presence_penalty"] = presence_penalty
+                resp = await self.client.chat.completions.create(**create_kwargs)
+                content = _strip_think_blocks(resp.choices[0].message.content or "")
                 usage = getattr(resp, "usage", None)
                 input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0
                 output_tokens = int(getattr(usage, "completion_tokens", 0) or 0) if usage else 0
@@ -184,6 +229,21 @@ class LLM:
                 if _looks_like_context_overflow(e):
                     _record_failure(e)
                     raise ContextOverflowError(str(e)) from e
+                if token_limit_param == "max_tokens" and _looks_like_max_tokens_not_supported(e):
+                    log.warning("model rejected max_tokens, retrying with max_completion_tokens")
+                    token_limit_param = "max_completion_tokens"
+                    continue
+                if (
+                    token_limit_param == "max_completion_tokens"
+                    and _looks_like_max_completion_tokens_not_supported(e)
+                ):
+                    log.warning("model rejected max_completion_tokens, retrying with max_tokens")
+                    token_limit_param = "max_tokens"
+                    continue
+                if not penalty_params_disabled and _looks_like_param_not_supported(e):
+                    log.warning("model rejected penalty params, retrying without them")
+                    penalty_params_disabled = True
+                    continue
                 _record_failure(e)
                 log.error("fatal api error: %s", e)
                 raise

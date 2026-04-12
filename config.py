@@ -101,6 +101,7 @@ class Config:
     debug_traces: bool
     enable_debug_logs: bool
     enable_metrics: bool
+    enable_background_extraction: bool
     orchestration_log_path: str
     creator_user_id: int | None
     creator_profile_path: str
@@ -170,6 +171,8 @@ def load_config() -> Config:
         debug_traces=os.getenv("DEBUG_TRACES", "0").strip().lower() in {"1", "true", "yes", "on"},
         enable_debug_logs=os.getenv("ENABLE_DEBUG_LOGS", "1").strip().lower() in {"1", "true", "yes", "on"},
         enable_metrics=os.getenv("ENABLE_METRICS", "1").strip().lower() in {"1", "true", "yes", "on"},
+        enable_background_extraction=os.getenv("ENABLE_BACKGROUND_EXTRACTION", "1").strip().lower()
+        in {"1", "true", "yes", "on"},
         orchestration_log_path=os.getenv("ORCHESTRATION_LOG_PATH", "./orchestration.log").strip(),
         creator_user_id=_parse_optional_int(os.getenv("CREATOR_USER_ID", "")),
         creator_profile_path=os.getenv("CREATOR_PROFILE_PATH", "./creator_profile.json").strip(),
@@ -196,7 +199,7 @@ def load_config() -> Config:
         elevenlabs_style=_parse_optional_float(os.getenv("ELEVENLABS_STYLE", "")),
         elevenlabs_speed=_parse_optional_float(os.getenv("ELEVENLABS_SPEED", "")),
         elevenlabs_use_speaker_boost=_parse_optional_bool(os.getenv("ELEVENLABS_USE_SPEAKER_BOOST", "")),
-        voice_reply_prob=_env_float("VOICE_REPLY_PROB", "0.18", min_val=0.0, max_val=1.0),
+        voice_reply_prob=_env_float("VOICE_REPLY_PROB", "0", min_val=0.0, max_val=1.0),
         voice_reply_cooldown_sec=_env_int("VOICE_REPLY_COOLDOWN_SEC", "180", min_val=0),
         voice_reply_max_chars=_env_int("VOICE_REPLY_MAX_CHARS", "320", min_val=1, max_val=4000),
     )

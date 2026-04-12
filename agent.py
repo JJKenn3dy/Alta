@@ -11,10 +11,12 @@ log = logging.getLogger("alta.agent")
 from file_context import build_file_context_block, retrieve_context_snippets, sync_context_dir
 from llm import ContextOverflowError
 from profile_context import load_profile, profile_to_system_block
-from prompts import ALTA_SYSTEM_PROMPT
+from prompts import ALTA_SYSTEM_PROMPT, ALTA_SYSTEM_PROMPT_BASE
+from search import web_search
 from telemetry import approx_messages_tokens, approx_text_tokens
 
-SUMMARY_EVERY_N_MESSAGES = 10
+MESSAGE_ROTATE_KEEP = 2_000
+MESSAGE_ROTATE_TRIGGER_DELTA = 120
 SUMMARY_HISTORY_WINDOW = 80
 MAX_FACT_ITEMS_PER_TURN = 6
 INTRO_MARKER_KEY = "_intro_requested"
@@ -24,7 +26,7 @@ HIGH_PRIORITY_KEYS = IDENTITY_KEYS | STYLE_KEYS
 MEMORY_STORE_MIN_IMPORTANCE = 0.3
 FACT_KEEP_PER_USER = 80
 FACT_CONTEXT_MIN_IMPORTANCE = 0.45
-CONTEXT_HISTORY_LIMIT = 30
+CONTEXT_HISTORY_LIMIT = 15
 SUMMARY_CONTEXT_CHAR_LIMIT = 700
 PROFILE_FIELD_CHAR_LIMIT = 200
 RELATIONSHIP_NOTES_CHAR_LIMIT = 250
@@ -43,6 +45,7 @@ MINIMAL_FILE_CONTEXT_CHUNKS = 1
 DEFAULT_FILE_CONTEXT_CHARS = 1_800
 COMPACT_FILE_CONTEXT_CHARS = 1_000
 MINIMAL_FILE_CONTEXT_CHARS = 500
+RAG_MIN_SNIPPET_SCORE = 3.0
 USER_DOCUMENT_CHAR_LIMIT = 900
 USER_DOCUMENT_FACT_LIMIT = 20
 MAX_CHAT_PARTICIPANTS = 8
@@ -51,6 +54,80 @@ REPEAT_GUARD_MAX_CHARS = 140
 REPEAT_GUARD_MIN_KEY_CHARS = 3
 REPEAT_GUARD_SHORT_EXACT_MIN_KEY_CHARS = 2
 REPEAT_GUARD_SUBSTRING_MAX_CHARS = 28
+USER_PREFIX_ID_PATTERN = re.compile(r"\[[^\]]*\bid=(\d+)\b", re.IGNORECASE)
+_SEARCH_RE = re.compile(r"\[SEARCH:\s*(.+?)\]", re.IGNORECASE)
+_WEB_HAS_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+_WEB_FACT_QUERY_PATTERNS = (
+    re.compile(r"\b(что случилось|что произошло|какие события|новости|кто выиграл|кто победил|сколько стоит|цена|курс|погода|результат)\b", re.IGNORECASE),
+    re.compile(r"\b(what happened|latest news|who won|price of|exchange rate|weather|score|result)\b", re.IGNORECASE),
+)
+_WEB_TIME_SENSITIVE_PATTERNS = (
+    re.compile(r"\b(сегодня|сейчас|последн(ие|яя|ий)|актуальн(ые|ая|ый)?|на данный момент)\b", re.IGNORECASE),
+    re.compile(r"\b(today|now|latest|currently|up[- ]?to[- ]?date)\b", re.IGNORECASE),
+    re.compile(
+        r"\b\d{1,2}\s+"
+        r"(январ[яь]|феврал[яь]|март[ае]?|апрел[яь]|ма[йя]|июн[яь]|июл[яь]|"
+        r"август[ае]?|сентябр[яь]|октябр[яь]|ноябр[яь]|декабр[яь])\s+"
+        r"(19|20)\d{2}\b",
+        re.IGNORECASE,
+    ),
+)
+_NOW_REFERENCE_PATTERNS = (
+    re.compile(r"\b(сейчас|сегодня|на данный момент|прямо сейчас)\b", re.IGNORECASE),
+    re.compile(r"\b(right now|today|current(?:ly)?|at the moment|now)\b", re.IGNORECASE),
+)
+_ASK_YEAR_PATTERNS = (
+    re.compile(r"\bгод\b", re.IGNORECASE),
+    re.compile(r"\b(what year|current year)\b", re.IGNORECASE),
+)
+_ASK_DATE_PATTERNS = (
+    re.compile(r"\bдата\b", re.IGNORECASE),
+    re.compile(r"\b(число|день)\b", re.IGNORECASE),
+    re.compile(r"\b(today'?s?\s+date|current date)\b", re.IGNORECASE),
+)
+_ASK_TIME_PATTERNS = (
+    re.compile(
+        r"\b(котор(ый|ое)\s+(сейчас\s+)?час|сколько\s+(сейчас\s+)?времени|текущее\s+время)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(what time|current time)\b", re.IGNORECASE),
+)
+_WEB_UNCERTAIN_ANSWER_PATTERNS = (
+    re.compile(r"\b(не знаю|не помню|не в курсе|не могу сказать|ты не говорил|мы не обсуждали)\b", re.IGNORECASE),
+    re.compile(r"\b(i don't know|not sure|we didn't discuss|you didn't tell me)\b", re.IGNORECASE),
+)
+_WEB_ENTITY_QUERY_PATTERNS = (
+    re.compile(r"\b(что за|что такое|кто такой|кто такая|кто такое)\b", re.IGNORECASE),
+    re.compile(r"\b(what is|who is|tell me about)\b", re.IGNORECASE),
+)
+_WEB_GAME_INTENT_PATTERNS = (
+    re.compile(r"\b(игра|игры|game|games|steam|itch\.io)\b", re.IGNORECASE),
+)
+_WEB_LATIN_TOKEN_RE = re.compile(r"\b[a-z][a-z0-9_-]{2,}\b", re.IGNORECASE)
+_WEB_CYRILLIC_RE = re.compile(r"[а-яё]", re.IGNORECASE)
+_WEB_SNIPPET_LINE_RE = re.compile(r"^\d+\.\s*(.+?)\s*$")
+_WEB_LATIN_GENERIC_WORDS = {
+    "what",
+    "who",
+    "when",
+    "where",
+    "why",
+    "how",
+    "is",
+    "are",
+    "the",
+    "this",
+    "that",
+    "about",
+    "game",
+    "games",
+    "news",
+    "price",
+    "latest",
+    "today",
+    "now",
+}
+_WEB_USERNAME_LIKE_RE = re.compile(r"\d")
 
 FACT_TYPE_LABELS = {
     "interest": "Интерес",
@@ -199,27 +276,27 @@ USER_SUMMARY_SYSTEM_PROMPT = """
 """.strip()
 
 MEMORY_EXTRACT_PROMPT = """
-Извлеки только устойчивые факты о пользователе из сообщения.
+Извлеки только устойчивые факты о пользователе из его сообщения.
 Верни строго JSON-массив объектов формата:
 [{"fact_type":"...", "value":"...", "confidence":0.0, "importance":0.0, "evidence":"..."}]
 
 Правила:
+- Извлекай ТОЛЬКО факты про самого автора сообщения (раздел "Сообщение пользователя").
+- Если в контексте есть "Другой участник чата" — его факты НЕЛЬЗЯ приписывать нашему пользователю.
+- Если пользователь говорит о ком-то другом ("мой друг любит...", "она занимается...") — это НЕ его факт.
 - Только личные факты и предпочтения, которые пригодятся позже.
-- Сообщение может быть из группового чата: извлекай факты только про автора текущего сообщения, а не про людей, которых он упомянул.
 - Не извлекай имя, ник, пол, местоимения, стиль ответа и прочие identity-поля: они обрабатываются отдельно.
-- Используй только fact_type из набора: interest, preference, work, study, location, goal, relationship, bio, fact.
+- Используй только fact_type из набора: interest, preference, work, study, location, goal, bio, fact.
 - evidence: короткая цитата или опора из сообщения, максимум 120 символов.
-- importance от 0.0 до 1.0: 1.0 это факт, который стоит помнить очень долго; 0.0 это почти мусор.
-- Не сохраняй как важное временные мелочи вроде "сейчас ем", "сегодня устал", если это не ключ к личности.
-- Не сохраняй случайный шум, сиюминутные эмоции, мемные вбросы без устойчивого смысла и факты о третьих лицах.
-- Не добавляй временный шум.
-- Максимум 6 объектов.
+- importance от 0.0 до 1.0: 1.0 — факт стоит помнить очень долго; 0.0 — почти мусор.
+- Не сохраняй временные мелочи ("сейчас ем", "сегодня устал"), сиюминутные эмоции, мемные вбросы.
+- Максимум 4 объекта.
 - confidence от 0.0 до 1.0.
 - Если извлекать нечего, верни [].
 """.strip()
 
 PROFILE_EXTRACT_PROMPT = """
-Ты обновляешь устойчивый профиль человека по одному сообщению.
+Ты обновляешь устойчивый профиль человека по его сообщению.
 Верни строго JSON-объект формата:
 {
   "display_name": "string or empty",
@@ -228,20 +305,18 @@ PROFILE_EXTRACT_PROMPT = """
   "interests": ["..."],
   "communication_style": "string or empty",
   "response_preference": "string or empty",
-  "relationship_notes": "string or empty",
   "profile_confidence": 0.0
 }
 
 Правила:
-- Обновляй только то, что действительно можно вывести из сообщения и уже имеющегося профиля.
-- Сообщение может быть из группового чата: обновляй профиль только автора текущего сообщения, не людей, которых он упомянул.
-- Если поле неясно, оставь пустую строку или пустой массив.
-- interests: 0-4 коротких интереса.
-- communication_style: как человек обычно пишет или как хочет, чтобы с ним говорили. Очень коротко.
-- response_preference: например "коротко", "по делу", "с юмором", "технически". Очень коротко.
-- relationship_notes: только полезные заметки о динамике общения. Максимум 1 короткая фраза.
+- Обновляй ТОЛЬКО на основе раздела "Сообщение пользователя", не на основе "Другой участник чата".
+- Если пользователь упомянул кого-то другого ("мой друг любит аниме") — это НЕ его интерес.
+- Если поле неясно из этого конкретного сообщения, оставь пустую строку или пустой массив.
+- interests: 0-3 коротких интереса, только явно заявленные самим пользователем. Не угадывать.
+- communication_style: как человек обычно пишет или общается. Только если очевидно из текста.
+- response_preference: пожелания к ответу ("коротко", "с юмором"). Только если явно сказано.
 - Не записывай мусорные значения вроде "ты", "он", "она", "неизвестно", "неопределено".
-- Никаких выдумок.
+- Никаких домыслов и выдумок. Лучше пустое поле, чем неверное.
 """.strip()
 
 CREATOR_PROFILE_PATTERNS = (
@@ -363,6 +438,7 @@ def _build_context_plans(max_tokens: int, history_limit: int) -> list[ContextPla
             file_chars=DEFAULT_FILE_CONTEXT_CHARS,
             max_tokens=safe_max_tokens,
             include_creator_profile=True,
+            include_participants=False,
         ),
         ContextPlan(
             name="compact",
@@ -374,6 +450,7 @@ def _build_context_plans(max_tokens: int, history_limit: int) -> list[ContextPla
             file_chars=COMPACT_FILE_CONTEXT_CHARS,
             max_tokens=min(safe_max_tokens, 280),
             include_creator_profile=True,
+            include_participants=False,
         ),
         ContextPlan(
             name="minimal",
@@ -615,6 +692,451 @@ def _recent_assistant_replies(messages: list[dict], limit: int = REPEAT_GUARD_WI
     return replies[-limit:]
 
 
+def _extract_search_query(answer: str) -> str | None:
+    match = _SEARCH_RE.search(answer or "")
+    return match.group(1).strip() if match else None
+
+
+def _contains_any_pattern(text: str, patterns: tuple[re.Pattern[str], ...]) -> bool:
+    value = " ".join((text or "").strip().split())
+    if not value:
+        return False
+    return any(pattern.search(value) for pattern in patterns)
+
+
+def _summary_update_interval(history_limit: int) -> int:
+    """Summary update cadence tied to effective history window size."""
+    try:
+        parsed = int(history_limit)
+    except (TypeError, ValueError):
+        parsed = CONTEXT_HISTORY_LIMIT
+    return max(1, min(parsed, CONTEXT_HISTORY_LIMIT))
+
+
+def _match_any(text: str, patterns: tuple[re.Pattern[str], ...]) -> bool:
+    return _contains_any_pattern(text, patterns)
+
+
+def _deterministic_now_answer(input_text: str) -> str | None:
+    text = " ".join((input_text or "").strip().split())
+    if not text:
+        return None
+    if not _match_any(text, _NOW_REFERENCE_PATTERNS):
+        return None
+    is_question = "?" in text or bool(
+        re.search(r"\b(какой|какая|какое|который|сколько|что|what|when|time|date|year)\b", text, re.IGNORECASE)
+    )
+    if not is_question:
+        return None
+
+    ask_year = _match_any(text, _ASK_YEAR_PATTERNS)
+    ask_date = _match_any(text, _ASK_DATE_PATTERNS)
+    ask_time = _match_any(text, _ASK_TIME_PATTERNS)
+    if not (ask_year or ask_date or ask_time):
+        return None
+
+    now = datetime.now().astimezone()
+    parts: list[str] = []
+    date_text = now.strftime("%d.%m.%Y")
+
+    if ask_date:
+        parts.append(f"сегодня {date_text}")
+    if ask_year and not ask_date:
+        parts.append(f"{now.year} год")
+    elif ask_year and ask_date:
+        parts.append(f"год {now.year}")
+    if ask_time:
+        parts.append(f"время {now.strftime('%H:%M')}")
+
+    if not parts:
+        return None
+
+    if parts and parts[0].startswith("сегодня "):
+        parts[0] = "Сегодня " + parts[0][len("сегодня ") :]
+        return _fit_text(", ".join(parts) + ".", 140)
+    return _fit_text("Сейчас " + ", ".join(parts) + ".", 140)
+
+
+def _format_utc_offset(value: str) -> str:
+    if not value:
+        return "+00:00"
+    if len(value) == 5:
+        return f"{value[:3]}:{value[3:]}"
+    return value
+
+
+def _current_datetime_system_block() -> str:
+    now = datetime.now().astimezone()
+    tz_name = now.tzname() or "local"
+    utc_offset = _format_utc_offset(now.strftime("%z"))
+    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    year = now.strftime("%Y")
+    return (
+        f"ТЕКУЩАЯ ДАТА И ВРЕМЯ: {timestamp} (UTC{utc_offset}, {tz_name}). ГОД: {year}.\n"
+        "Это системный факт. Не угадывай год из обучающих данных — они устарели.\n"
+        "На любой вопрос о дате, времени, годе, месяце, «сейчас», «сегодня» — отвечай ТОЛЬКО по этим данным."
+    )
+
+
+def _contains_cyrillic(text: str) -> bool:
+    return bool(_WEB_CYRILLIC_RE.search(text or ""))
+
+
+def _looks_like_web_fact_query(input_text: str) -> bool:
+    return _contains_any_pattern(input_text, _WEB_FACT_QUERY_PATTERNS)
+
+
+def _looks_like_entity_query(input_text: str) -> bool:
+    return _contains_any_pattern(input_text, _WEB_ENTITY_QUERY_PATTERNS)
+
+
+def _looks_like_time_sensitive_query(input_text: str) -> bool:
+    return _contains_any_pattern(input_text, _WEB_TIME_SENSITIVE_PATTERNS)
+
+
+def _has_game_intent(text: str) -> bool:
+    return _contains_any_pattern(text, _WEB_GAME_INTENT_PATTERNS)
+
+
+def _answer_signals_missing_facts(answer: str) -> bool:
+    return _contains_any_pattern(answer, _WEB_UNCERTAIN_ANSWER_PATTERNS)
+
+
+_QUESTION_RE = re.compile(r"\?|^(кто|что|как|где|когда|зачем|почему|сколько|какой|какая|какое|какие|чей|чья|чьё|кем|чем)\b", re.IGNORECASE | re.MULTILINE)
+_PROPER_NOUN_PATTERNS = (
+    re.compile(r"\b[A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,})*\b"),
+    re.compile(r"\b[А-ЯЁ][А-ЯЁа-яё0-9_-]{2,}(?:\s+[А-ЯЁ][А-ЯЁа-яё0-9_-]{2,})*\b"),
+)
+_PROPER_NOUN_STOPWORDS = {
+    "а",
+    "без",
+    "более",
+    "был",
+    "была",
+    "были",
+    "было",
+    "быть",
+    "в",
+    "вам",
+    "вас",
+    "ваш",
+    "ваша",
+    "ваше",
+    "ваши",
+    "вы",
+    "где",
+    "да",
+    "для",
+    "его",
+    "ее",
+    "её",
+    "если",
+    "есть",
+    "еще",
+    "ещё",
+    "за",
+    "здесь",
+    "и",
+    "или",
+    "их",
+    "как",
+    "какая",
+    "какие",
+    "какой",
+    "какое",
+    "кем",
+    "когда",
+    "кто",
+    "ли",
+    "мне",
+    "мог",
+    "могу",
+    "может",
+    "мы",
+    "на",
+    "над",
+    "не",
+    "нет",
+    "но",
+    "ну",
+    "о",
+    "об",
+    "он",
+    "она",
+    "они",
+    "оно",
+    "от",
+    "по",
+    "под",
+    "при",
+    "про",
+    "раз",
+    "с",
+    "со",
+    "так",
+    "там",
+    "ты",
+    "у",
+    "уже",
+    "что",
+    "эта",
+    "это",
+    "эту",
+    "я",
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "but",
+    "by",
+    "for",
+    "from",
+    "he",
+    "her",
+    "him",
+    "his",
+    "i",
+    "if",
+    "in",
+    "is",
+    "it",
+    "its",
+    "me",
+    "my",
+    "of",
+    "on",
+    "or",
+    "our",
+    "she",
+    "that",
+    "the",
+    "their",
+    "there",
+    "they",
+    "this",
+    "to",
+    "was",
+    "we",
+    "were",
+    "you",
+    "your",
+}
+_WEB_SEARCH_DEFER_PATTERNS = (
+    re.compile(r"\b(ищу|поищу|погуглю|гуглю|сейчас посмотрю|секунду|секундочку|подожди)\b", re.IGNORECASE),
+    re.compile(r"\b(searching|let me (?:check|search)|one second|hold on)\b", re.IGNORECASE),
+)
+
+
+def _extract_context_entities(history: list[dict]) -> list[str]:
+    """Extract entity-like tokens from the last few messages in history."""
+    seen: set[str] = set()
+    tokens: list[str] = []
+    for msg in (history or [])[-8:]:
+        content = msg.get("content") or ""
+        for token in _extract_latin_query_tokens(content):
+            if _WEB_USERNAME_LIKE_RE.search(token):
+                continue
+            norm = token.lower()
+            if norm not in seen:
+                seen.add(norm)
+                tokens.append(token)
+        for token in _extract_proper_nouns(content):
+            if _WEB_USERNAME_LIKE_RE.search(token):
+                continue
+            norm = " ".join(token.lower().split())
+            if norm not in seen:
+                seen.add(norm)
+                tokens.append(token)
+    return tokens
+
+
+def _answer_introduces_new_claims(
+    answer: str, history: list[dict] | None,
+) -> str | None:
+    """If answer introduces new entity names not seen in recent history, return a query."""
+    if not answer:
+        return None
+    new_names = _extract_proper_nouns(answer)
+    if not new_names:
+        return None
+    # Collect entity-like mentions from recent history to detect genuinely new claims.
+    history_entities: set[str] = set()
+    for msg in (history or [])[-8:]:
+        for entity in _extract_proper_nouns(msg.get("content") or ""):
+            history_entities.add(" ".join(entity.lower().split()))
+    novel = [n for n in new_names if " ".join(n.lower().split()) not in history_entities]
+    if not novel:
+        return None
+    # Build query from context entities + novel names
+    ctx = _extract_context_entities(history)
+    parts = []
+    if ctx:
+        parts.append(ctx[0])
+    if not parts or parts[0].lower() != novel[0].lower():
+        parts.append(novel[0])
+    if not parts:
+        return None
+    return " ".join(parts)
+
+
+def _extract_latin_query_tokens(text: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for match in _WEB_LATIN_TOKEN_RE.finditer(text or ""):
+        token = match.group(0).lower()
+        if token in _WEB_LATIN_GENERIC_WORDS:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+    return out
+
+
+def _extract_proper_nouns(text: str) -> list[str]:
+    value = str(text or "")
+    if not value:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for pattern in _PROPER_NOUN_PATTERNS:
+        for match in pattern.finditer(value):
+            candidate = " ".join(match.group(0).split()).strip()
+            if not candidate:
+                continue
+            token_lower = candidate.lower()
+            if token_lower in _PROPER_NOUN_STOPWORDS:
+                continue
+            if token_lower in seen:
+                continue
+            seen.add(token_lower)
+            out.append(candidate)
+    return out
+
+
+def _answer_defers_web_lookup(answer: str) -> bool:
+    value = " ".join((answer or "").strip().split())
+    if not value:
+        return False
+    return any(pattern.search(value) for pattern in _WEB_SEARCH_DEFER_PATTERNS)
+
+
+def _should_force_web_fallback(answer: str) -> bool:
+    if not (answer or "").strip():
+        return True
+    if _extract_search_query(answer):
+        return True
+    if _answer_signals_missing_facts(answer):
+        return True
+    if _answer_defers_web_lookup(answer):
+        return True
+    return False
+
+
+def _pick_web_search_query(
+    input_text: str, answer: str, context_history: list[dict] | None = None
+) -> str | None:
+    explicit = _extract_search_query(answer)
+    latin_tokens = _extract_latin_query_tokens(input_text)
+    has_latin_entity = bool(latin_tokens)
+    has_cyrillic_input = _contains_cyrillic(input_text)
+    game_intent_input = _has_game_intent(input_text)
+    if explicit:
+        if has_cyrillic_input and not _contains_cyrillic(explicit):
+            return _fit_text(input_text, 200)
+        explicit_tokens = _extract_latin_query_tokens(explicit)
+        if not explicit_tokens and has_latin_entity:
+            explicit_tokens = latin_tokens
+        explicit_norm = " ".join((explicit or "").strip().lower().split())
+        has_game_intent_explicit = _has_game_intent(explicit_norm)
+        if explicit_tokens and (has_game_intent_explicit or game_intent_input):
+            if has_cyrillic_input:
+                return _fit_text(input_text, 200)
+            if len(explicit_tokens) > 1:
+                return _fit_text(" ".join(explicit_tokens[:4]), 120)
+            return _fit_text(f"{explicit_tokens[0]} game", 120)
+        return _fit_text(explicit, 200)
+
+    if _looks_like_entity_query(input_text):
+        if has_latin_entity:
+            if has_cyrillic_input:
+                return _fit_text(input_text, 200)
+            if game_intent_input:
+                if len(latin_tokens) > 1:
+                    return _fit_text(" ".join(latin_tokens[:4]), 120)
+                return _fit_text(f"{latin_tokens[0]} game", 120)
+            return _fit_text(input_text, 200)
+        # No latin entity in input — try to resolve pronoun reference from history
+        ctx_entities = _extract_context_entities(context_history) if context_history else []
+        if ctx_entities:
+            if game_intent_input:
+                return _fit_text(f"{ctx_entities[0]} game", 120)
+            return _fit_text(f"{ctx_entities[0]} {input_text}"[:200], 200)
+        return _fit_text(input_text, 200)
+
+    # Smart safety-net: if input is a factual question and answer introduces new proper nouns
+    # not seen in conversation history → likely unverified claim → trigger search.
+    # Only fires for factual/entity queries, NOT social/personal questions, to avoid
+    # false positives like searching "Захар Спорить" or "Захар Неприятно".
+    if _QUESTION_RE.search(input_text or "") and (
+        _looks_like_web_fact_query(input_text) or _looks_like_entity_query(input_text)
+    ):
+        claim_query = _answer_introduces_new_claims(answer, context_history)
+        if claim_query:
+            return _fit_text(claim_query, 200)
+
+    if not _looks_like_web_fact_query(input_text):
+        if has_latin_entity and _answer_signals_missing_facts(answer):
+            if has_cyrillic_input:
+                return _fit_text(input_text, 200)
+            if game_intent_input:
+                if len(latin_tokens) > 1:
+                    return _fit_text(" ".join(latin_tokens[:4]), 120)
+                return _fit_text(f"{latin_tokens[0]} game", 120)
+            return _fit_text(input_text, 200)
+        return None
+
+    if _looks_like_time_sensitive_query(input_text):
+        return _fit_text(input_text, 200)
+
+    if _WEB_HAS_YEAR_RE.search(input_text or "") and _answer_signals_missing_facts(answer):
+        return _fit_text(input_text, 200)
+
+    if _answer_signals_missing_facts(answer):
+        return _fit_text(input_text, 200)
+
+    return None
+
+
+def _build_web_fallback_answer(input_text: str, web_text: str, max_items: int = 2) -> str:
+    latin_tokens = _extract_latin_query_tokens(input_text)
+    lines = []
+    for raw_line in str(web_text or "").splitlines():
+        line = raw_line.strip()
+        match = _WEB_SNIPPET_LINE_RE.match(line)
+        if not match:
+            continue
+        item = _fit_text(match.group(1), 150)
+        lowered = item.lower()
+        if latin_tokens and not any(token in lowered for token in latin_tokens):
+            continue
+        if item:
+            lines.append(item)
+        if len(lines) >= max_items:
+            break
+
+    if not lines:
+        return ""
+
+    prefix = "По поиску вижу: "
+    if _WEB_HAS_YEAR_RE.search(input_text or ""):
+        prefix = "По поиску по этой дате вижу: "
+    return _fit_text(prefix + "; ".join(lines), 340)
+
+
 def _is_repeated_recent_reply(answer: str, recent_assistant_replies: list[str]) -> bool:
     candidate = _normalize_reply_text(answer)
     if not candidate:
@@ -772,6 +1294,8 @@ def _deterministic_postprocess_answer(draft_answer: str) -> str:
         return ""
 
     value = _strip_list_prefixes(raw) if "\n" in raw or LIST_PREFIX_PATTERN.search(raw) else raw
+    # Strip any [SEARCH: ...] tags that leaked into the final answer
+    value = _SEARCH_RE.sub("", value).strip()
     # Strip timestamp prefix the model may copy from history context
     value = re.sub(r"^\[\d{1,2}:\d{2}\]\s*", "", value)
     value = EMOJI_PATTERN.sub("", value)
@@ -1475,11 +1999,12 @@ async def maybe_update_summary(
     updated = False
     message_count = await db.count_messages(chat_id)
     user_msg_count = await db.count_user_messages(chat_id, user_id)
+    interval = _summary_update_interval(history_limit)
     should_update_chat_summary = (
-        message_count >= SUMMARY_EVERY_N_MESSAGES and message_count % SUMMARY_EVERY_N_MESSAGES == 0
+        message_count >= interval and message_count % interval == 0
     )
     should_update_user_summary = (
-        user_msg_count >= SUMMARY_EVERY_N_MESSAGES and user_msg_count % SUMMARY_EVERY_N_MESSAGES == 0
+        user_msg_count >= interval and user_msg_count % interval == 0
     )
     if not should_update_chat_summary and not should_update_user_summary:
         return False
@@ -1520,7 +2045,10 @@ async def maybe_update_summary(
             max(history_limit, SUMMARY_HISTORY_WINDOW),
             focus_user_id=user_id,
         )
-        user_history_text = _history_as_text(recent_user_history, SUMMARY_INPUT_CHAR_LIMIT)
+        # Use only the user's own messages for user summary — assistant replies may
+        # contain topics from other users and pollute the per-user summary.
+        user_only_messages = [m for m in recent_user_history if m.get("role") == "user"]
+        user_history_text = _history_as_text(user_only_messages, SUMMARY_INPUT_CHAR_LIMIT)
         user_row = await db.get_user(user_id)
         user_label = f"@{user_row['username']}" if user_row and user_row.get("username") else f"id={user_id}"
         user_summary_input = (
@@ -1546,9 +2074,9 @@ async def maybe_update_summary(
         except Exception:
             log.warning("failed to update user summary chat=%s user=%s", chat_id, user_id, exc_info=True)
 
-    if updated and message_count > 2000:
+    if updated and message_count > (MESSAGE_ROTATE_KEEP + MESSAGE_ROTATE_TRIGGER_DELTA):
         try:
-            await db.rotate_messages(chat_id, keep=2000)
+            await db.rotate_messages(chat_id, keep=MESSAGE_ROTATE_KEEP)
         except Exception:
             log.warning("failed to rotate messages chat=%s", chat_id, exc_info=True)
 
@@ -1656,7 +2184,7 @@ async def maybe_store_user_profile(
     if not should_extract_user_facts(text):
         return {"attempted": 0, "changed": 0}
 
-    current_profile = await db.get_user_profile(chat_id, user_id)
+    current_profile = await db.get_user_profile_merged(chat_id, user_id)
     current_profile_json = json.dumps(current_profile, ensure_ascii=False)
     payload = (
         f"Текущий профиль:\n{current_profile_json}\n\n"
@@ -1698,24 +2226,21 @@ async def maybe_store_user_profile(
         profile.get("response_preference"),
         PROFILE_FIELD_CHAR_LIMIT,
     )
-    relationship_notes = _clean_profile_text(
-        profile.get("relationship_notes"),
-        RELATIONSHIP_NOTES_CHAR_LIMIT,
-    )
+    # relationship_notes is intentionally NOT auto-extracted — too prone to capturing
+    # transient conversational states ("доверяет собеседнику сейчас") instead of
+    # stable facts. Users can set it manually via /profile.
     await db.upsert_user_profile(
         chat_id,
         user_id,
         interests=interests,
         communication_style=communication_style,
         response_preference=response_preference,
-        relationship_notes=relationship_notes,
         profile_confidence=confidence,
     )
     attempted_profile = {
         "interests": interests,
         "communication_style": communication_style,
         "response_preference": response_preference,
-        "relationship_notes": relationship_notes,
         "profile_confidence": confidence,
     }
     attempted_count = sum(1 for key, value in attempted_profile.items() if key == "profile_confidence" or value)
@@ -1731,7 +2256,7 @@ async def maybe_store_identity_from_telegram(
     sender_first_name: str | None,
 ):
     current_memories = _memory_record_map(await db.get_memories(chat_id, user_id, limit=64))
-    current_profile = await db.get_user_profile(chat_id, user_id)
+    current_profile = await db.get_user_profile_merged(chat_id, user_id)
     nickname = None
     display_name = None
     memory_items_attempted = 0
@@ -1832,7 +2357,7 @@ async def sync_user_document(
     sender_first_name: str | None,
 ):
     user_facts = await db.get_user_facts(chat_id, user_id, limit=FACT_KEEP_PER_USER)
-    user_profile = await db.get_user_profile(chat_id, user_id)
+    user_profile = await db.get_user_profile_merged(chat_id, user_id)
     payload = build_user_document_payload(
         user_facts,
         user_profile,
@@ -1852,7 +2377,7 @@ async def should_ask_intro(db, chat_id: int, user_id: int, input_text: str) -> b
     if _is_nonsemantic_input(text):
         return False
 
-    profile = await db.get_user_profile(chat_id, user_id)
+    profile = await db.get_user_profile_merged(chat_id, user_id)
 
     has_display_name = bool(
         (profile.get("approved_display_name") or profile.get("display_name") or "").strip()
@@ -1870,6 +2395,94 @@ async def should_ask_intro(db, chat_id: int, user_id: int, input_text: str) -> b
         return False
 
     return True
+
+
+def _max_context_snippet_score(snippets: list[dict]) -> float:
+    best = 0.0
+    for snippet in snippets:
+        try:
+            score = float((snippet or {}).get("score", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if score > best:
+            best = score
+    return best
+
+
+def _extract_prefixed_user_id(content: str) -> int | None:
+    match = USER_PREFIX_ID_PATTERN.search(str(content or ""))
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _should_include_participants_context(
+    input_text: str,
+    prompt_history: list[dict],
+    current_user_id: int,
+) -> bool:
+    # Keep participants disabled by default and only enable in ambiguous multi-user turns.
+    normalized = " ".join((input_text or "").lower().split())
+    if not normalized:
+        return False
+    trivial_turns = {
+        "привет",
+        "ку",
+        "ок",
+        "оке",
+        "ага",
+        "угу",
+        "ясно",
+        "пон",
+        "понял",
+        "поняла",
+        "спс",
+        "спасибо",
+        "hi",
+        "hello",
+    }
+    if normalized in trivial_turns:
+        return False
+
+    other_user_ids: set[int] = set()
+    for item in prompt_history:
+        if item.get("role") != "user":
+            continue
+        uid = _extract_prefixed_user_id(item.get("content", ""))
+        if uid is None or uid == current_user_id:
+            continue
+        other_user_ids.add(uid)
+
+    if not other_user_ids:
+        return False
+
+    if _looks_like_context_dependent_reply(input_text):
+        return True
+
+    ambiguous_markers = (
+        "он",
+        "она",
+        "его",
+        "ее",
+        "её",
+        "ему",
+        "ей",
+        "они",
+        "их",
+        "кто",
+        "кому",
+        "чей",
+        "чья",
+        "чьи",
+    )
+    if any(marker in normalized for marker in ambiguous_markers):
+        return True
+    if "@" in normalized:
+        return True
+    return False
 
 
 async def build_context(
@@ -1890,15 +2503,7 @@ async def build_context(
     summary = await db.get_summary(chat_id)
     speaker_summary = await db.get_summary(chat_id, user_id)
     user_facts = await db.get_user_facts(chat_id, user_id, limit=FACT_KEEP_PER_USER)
-    user_profile = await db.get_user_profile(chat_id, user_id)
-    user_document = await db.get_user_document(chat_id, user_id)
-    chat_participants = (
-        await db.get_chat_participants(
-            chat_id, exclude_user_id=user_id, limit=MAX_CHAT_PARTICIPANTS,
-        )
-        if plan.include_participants
-        else []
-    )
+    user_profile = await db.get_user_profile_merged(chat_id, user_id)
     focused_history = await db.get_last_messages(
         chat_id,
         min(history_limit, max(plan.history_messages * 2, 12)),
@@ -1911,98 +2516,108 @@ async def build_context(
     )
     history = _merge_histories(focused_history, shared_history, plan.history_messages, plan.history_chars)
     prompt_history = [{"role": item["role"], "content": item["content"]} for item in history]
-    implicit_reply_block = build_implicit_reply_context_block(prompt_history, input_text)
+    focused_prompt_history = [{"role": item["role"], "content": item["content"]} for item in focused_history]
+    implicit_reply_block = ""
+    if not reply_context:
+        implicit_reply_block = build_implicit_reply_context_block(focused_prompt_history, input_text)
 
-    # Inject implicit context directly into the last user message so the model
-    # sees it right next to the short message, not buried in the system prompt.
-    if implicit_reply_block and prompt_history:
+    # Inject reply context directly into the last user message so the model sees it
+    # right next to the short/ambiguous message, not buried in the system prompt.
+    # Explicit Telegram reply context takes priority over the implicit fallback.
+    inline_reply_prefix = ""
+    if reply_context:
+        author = _format_reply_author(reply_context)
+        reply_snippet = _fit_text(reply_context.text, 200)
+        if reply_snippet:
+            inline_reply_prefix = f"[отвечает на сообщение {author}: «{reply_snippet}»]"
+    elif implicit_reply_block:
+        inline_reply_prefix = f"[контекст: {implicit_reply_block}]"
+
+    if inline_reply_prefix and prompt_history:
         for i in range(len(prompt_history) - 1, -1, -1):
             if prompt_history[i].get("role") == "user":
                 original_content = prompt_history[i]["content"]
                 prompt_history[i] = {
                     "role": "user",
-                    "content": f"[контекст: {implicit_reply_block}]\n{original_content}",
+                    "content": f"{inline_reply_prefix}\n{original_content}",
                 }
                 break
 
     system_blocks = []
 
-    system_blocks.extend([
-        {
-            "content": (
-                "В истории пользовательские реплики помечены автором в формате [id=123 @username]. "
-                "Строго различай авторов и не приписывай слова одного человека другому."
-            ),
-            "bucket": "system",
-            "label": "speaker_guard",
-        },
-        {
-            "content": build_current_speaker_block(user_id, sender_username, sender_first_name),
-            "bucket": "system",
-            "label": "current_speaker",
-        }
-    ])
-    if implicit_reply_block:
-        system_blocks.append(
-            {
-                "content": implicit_reply_block,
-                "bucket": "system",
-                "label": "implicit_reply_context",
-            }
-        )
-    mention_only_block = build_mention_only_block(mention_only)
-    if mention_only_block:
-        system_blocks.append(
-            {
-                "content": mention_only_block,
-                "bucket": "system",
-                "label": "mention_only",
-            }
-        )
-    reply_block = build_reply_context_block(reply_context)
-    if reply_block:
-        system_blocks.append(
-            {
-                "content": reply_block,
-                "bucket": "system",
-                "label": "reply_context",
-            }
-        )
-    speaker_summary_budget = max(plan.summary_chars * 3 // 5, 200)
-    general_summary_budget = max(plan.summary_chars - speaker_summary_budget, 120)
-    clipped_speaker_summary = _clip_text(speaker_summary, speaker_summary_budget)
-    if clipped_speaker_summary:
-        system_blocks.append(
-            {
-                "bucket": "summary",
-                "label": "speaker_summary",
-                "content": (
-                    "Краткое резюме диалога с текущим собеседником. "
-                    "Это важнее общего summary, если нужно понять, на что он отвечает.\n"
-                    f"{clipped_speaker_summary}"
-                ).strip(),
-            }
-        )
+    # current_datetime is injected directly into the system prompt (not as a "справка" block)
 
-    clipped_summary = _clip_text(summary, general_summary_budget)
-    if clipped_summary:
-        system_blocks.append(
-            {
-                "bucket": "summary",
-                "label": "summary",
-                "content": (
-                    "Краткое резюме общего чата. В нем могут быть разные участники. "
-                    "Не переноси чужие факты на текущего собеседника.\n"
-                    f"{clipped_summary}"
-                ).strip(),
-            }
-        )
-
+    # 1. Личность собеседника
     identity_block = build_identity_block(user_profile, sender_username, sender_first_name)
     if identity_block:
         system_blocks.append({"content": identity_block, "bucket": "system", "label": "identity"})
 
-    if plan.include_participants:
+    # 2. Кто пишет сейчас + speaker_guard
+    system_blocks.append({
+        "content": (
+            build_current_speaker_block(user_id, sender_username, sender_first_name)
+            + "\nВ истории реплики помечены [id=123 @username]. Строго различай авторов."
+        ),
+        "bucket": "system",
+        "label": "current_speaker",
+    })
+
+    mention_only_block = build_mention_only_block(mention_only)
+    if mention_only_block:
+        system_blocks.append({
+            "content": mention_only_block,
+            "bucket": "system",
+            "label": "mention_only",
+        })
+
+    # 5. Память / факты о собеседнике
+    mem_text = format_user_facts(user_facts, max_lines=plan.memory_lines)
+    if mem_text:
+        system_blocks.append({
+            "content": f"Заметки о собеседнике:\n{mem_text}".strip(),
+            "bucket": "memory",
+            "label": "memory",
+        })
+
+    # 6. Резюме диалога с текущим собеседником
+    speaker_summary_budget = max(plan.summary_chars * 3 // 5, 200)
+    general_summary_budget = max(plan.summary_chars - speaker_summary_budget, 120)
+    clipped_speaker_summary = _clip_text(speaker_summary, speaker_summary_budget)
+    if clipped_speaker_summary:
+        system_blocks.append({
+            "bucket": "summary",
+            "label": "speaker_summary",
+            "content": (
+                "Контекст прошлых разговоров с текущим собеседником (только для справки). "
+                "Не перечисляй эти темы сам — отвечай только на то, о чём спрашивают сейчас.\n"
+                f"{clipped_speaker_summary}"
+            ).strip(),
+        })
+
+    # 7. Общее резюме чата
+    clipped_summary = _clip_text(summary, general_summary_budget)
+    if clipped_summary:
+        system_blocks.append({
+            "bucket": "summary",
+            "label": "summary",
+            "content": (
+                "Краткое резюме общего чата. В нем могут быть разные участники. "
+                "Не переноси чужие факты на текущего собеседника.\n"
+                f"{clipped_summary}"
+            ).strip(),
+        })
+
+    include_participants = plan.include_participants or _should_include_participants_context(
+        input_text,
+        prompt_history,
+        user_id,
+    )
+    if include_participants:
+        chat_participants = await db.get_chat_participants(
+            chat_id,
+            exclude_user_id=user_id,
+            limit=MAX_CHAT_PARTICIPANTS,
+        )
         participants_block = build_chat_participants_block(chat_participants, user_id)
         if participants_block:
             system_blocks.append({
@@ -2011,29 +2626,7 @@ async def build_context(
                 "label": "participants",
             })
 
-    mem_text = format_user_facts(user_facts, max_lines=plan.memory_lines)
-    if mem_text:
-        system_blocks.append(
-            {
-                "content": f"Заметки о собеседнике:\n{mem_text}".strip(),
-                "bucket": "memory",
-                "label": "memory",
-            }
-        )
-
-    document_text = _fit_text(user_document.get("document_text", ""), USER_DOCUMENT_CHAR_LIMIT)
-    if should_include_user_document(input_text, document_text):
-        system_blocks.append(
-            {
-                "bucket": "system",
-                "label": "user_document",
-                "content": (
-                    f"{document_text}\n"
-                    "Используй это только как внутренний контекст. Не цитируй досье буквально."
-                ).strip(),
-            }
-        )
-
+    # user_document prompt injection is intentionally disabled to avoid duplication with identity+memory.
     if plan.file_chunks > 0 and plan.file_chars > 0:
         await sync_context_dir(
             db,
@@ -2047,9 +2640,10 @@ async def build_context(
             max_chunks=plan.file_chunks,
             max_chars=plan.file_chars,
         )
-        file_block = build_file_context_block(snippets)
-        if file_block:
-            system_blocks.append({"content": file_block, "bucket": "rag", "label": "rag"})
+        if _max_context_snippet_score(snippets) >= RAG_MIN_SNIPPET_SCORE:
+            file_block = build_file_context_block(snippets)
+            if file_block:
+                system_blocks.append({"content": file_block, "bucket": "rag", "label": "rag"})
 
     context_metrics = {
         "history_tokens": approx_messages_tokens(prompt_history),
@@ -2089,8 +2683,13 @@ def _compose_system_prompt(
     creator_profile_path: str,
     system_blocks: list[dict[str, str]],
     include_creator_profile: bool,
+    include_search_instruction: bool = True,
 ) -> tuple[str, dict[str, int]]:
-    system_prompt = ALTA_SYSTEM_PROMPT
+    base = ALTA_SYSTEM_PROMPT if include_search_instruction else ALTA_SYSTEM_PROMPT_BASE
+    # Inject current datetime as a hard rule BEFORE everything else, so it is
+    # not framed as optional "context/reference" and cannot be dismissed by the model.
+    datetime_rule = _current_datetime_system_block()
+    system_prompt = datetime_rule + "\n\n" + base
     if system_blocks:
         system_prompt = (
             system_prompt
@@ -2109,7 +2708,7 @@ def _compose_system_prompt(
     # Reminder at the end to keep personality dominant over context blocks
     system_prompt += "\n\n---\nПомни: ты Альта. Отвечай коротко, живо, по-человечески. Контекст выше - справка, не шаблон."
 
-    system_tokens = approx_text_tokens(ALTA_SYSTEM_PROMPT) + sum(
+    system_tokens = approx_text_tokens(base) + sum(
         approx_text_tokens(item["content"])
         for item in system_blocks
         if item.get("bucket") == "system"
@@ -2240,6 +2839,7 @@ async def _generate_answer_with_fallback(
     turn_metrics=None,
 ) -> tuple[str, str, list[dict], list[dict], bool]:
     last_overflow: Exception | None = None
+    search_done = False
 
     for plan in _build_context_plans(max_tokens, history_limit):
         system_blocks, filtered, context_metrics = await build_context(
@@ -2264,6 +2864,7 @@ async def _generate_answer_with_fallback(
             creator_profile_path,
             system_blocks,
             plan.include_creator_profile,
+            include_search_instruction=not search_done,
         )
         context_snapshot = _merge_context_metrics(context_metrics, prompt_metrics)
         if turn_metrics is not None:
@@ -2279,6 +2880,57 @@ async def _generate_answer_with_fallback(
                 turn_id=turn_id,
                 turn_metrics=turn_metrics,
             )
+            if not search_done:
+                model_search_query = _extract_search_query(answer)
+                search_query = _pick_web_search_query(input_text, answer, context_history=filtered)
+                if search_query:
+                    search_done = True
+                    if not model_search_query:
+                        log.info("web search safety-net triggered query=%r", search_query)
+                    web_result = await web_search(search_query)
+                    if web_result and web_result.text:
+                        web_fallback_answer = _build_web_fallback_answer(input_text, web_result.text)
+                        web_blocks = list(system_blocks) + [
+                            {
+                                "content": web_result.text,
+                                "bucket": "web",
+                                "label": "web_search",
+                            }
+                        ]
+                        web_prompt, web_prompt_metrics = _compose_system_prompt(
+                            input_text,
+                            user_id,
+                            creator_user_id,
+                            creator_profile_path,
+                            web_blocks,
+                            plan.include_creator_profile,
+                            include_search_instruction=False,
+                        )
+                        if turn_metrics is not None:
+                            turn_metrics.set_context_metrics(
+                                _merge_context_metrics(context_metrics, web_prompt_metrics)
+                            )
+                        try:
+                            answer = await llm.chat(
+                                web_prompt,
+                                filtered,
+                                temperature,
+                                top_p,
+                                plan.max_tokens,
+                                turn_id=turn_id,
+                                turn_metrics=turn_metrics,
+                            )
+                            if _should_force_web_fallback(answer) and web_fallback_answer:
+                                log.info("web regen produced unusable answer, using deterministic web fallback")
+                                answer = web_fallback_answer
+                            system_prompt, system_blocks = web_prompt, web_blocks
+                        except Exception:
+                            log.warning("web regen failed, falling through", exc_info=True)
+                            answer = web_fallback_answer
+                    else:
+                        answer = ""
+                    if not answer.strip():
+                        continue
             return answer, system_prompt, filtered, system_blocks, False
         except ContextOverflowError as e:
             last_overflow = e
@@ -2288,7 +2940,7 @@ async def _generate_answer_with_fallback(
     fallback_messages = [{"role": "user", "content": fallback_input}]
     try:
         fallback_answer = await llm.chat(
-            ALTA_SYSTEM_PROMPT,
+            ALTA_SYSTEM_PROMPT_BASE,
             fallback_messages,
             temperature,
             top_p,
@@ -2303,8 +2955,9 @@ async def _generate_answer_with_fallback(
                     "summary_tokens": 0,
                     "memory_tokens": 0,
                     "rag_tokens": 0,
-                    "system_tokens": approx_text_tokens(ALTA_SYSTEM_PROMPT),
-                    "input_tokens": approx_messages_tokens(fallback_messages) + approx_text_tokens(ALTA_SYSTEM_PROMPT),
+                    "system_tokens": approx_text_tokens(ALTA_SYSTEM_PROMPT_BASE),
+                    "input_tokens": approx_messages_tokens(fallback_messages)
+                    + approx_text_tokens(ALTA_SYSTEM_PROMPT_BASE),
                     "identity_tokens": 0,
                     "user_document_tokens": 0,
                     "current_speaker_tokens": 0,
@@ -2312,7 +2965,7 @@ async def _generate_answer_with_fallback(
                     "creator_profile_tokens": 0,
                 }
             )
-        return fallback_answer, ALTA_SYSTEM_PROMPT, fallback_messages, [], True
+        return fallback_answer, ALTA_SYSTEM_PROMPT_BASE, fallback_messages, [], True
     except ContextOverflowError as e:
         last_overflow = e
 
@@ -2426,7 +3079,7 @@ async def generate_simple_reply_fallback(
     if not text:
         return "а?"
 
-    fallback_system = ALTA_SYSTEM_PROMPT + "\n\nОтвечай коротко, одно-два предложения."
+    fallback_system = ALTA_SYSTEM_PROMPT_BASE + "\n\nОтвечай коротко, одно-два предложения."
 
     try:
         answer = await llm.chat(
@@ -2446,30 +3099,44 @@ async def generate_simple_reply_fallback(
 
 
 async def _build_extraction_text(db, chat_id: int, user_id: int, input_text: str) -> str:
-    """Build extraction input with recent dialogue context for better fact extraction."""
+    """Build extraction input with recent dialogue context for better fact extraction.
+
+    IMPORTANT: messages from OTHER users are clearly labeled to prevent cross-user
+    fact contamination (e.g. attributing user A's interests to user B).
+    """
     try:
-        recent = await db.get_last_messages(chat_id, 6, focus_user_id=None)
+        recent = await db.get_last_messages(chat_id, 8, focus_user_id=None)
     except Exception:
         return input_text
 
-    # Take last few messages (excluding the current one which is input_text)
     context_lines = []
-    for msg in recent[-5:]:
+    for msg in reversed(recent):  # oldest first
         role = msg.get("role", "")
+        msg_user_id = msg.get("user_id")
         content = msg.get("content", "")
         if not content:
             continue
-        # Skip if this is the current message
+        # Skip the current message — it's passed separately as input_text
         if role == "user" and content.endswith(input_text):
             continue
-        prefix = "Собеседник" if role == "user" else "Альта"
-        context_lines.append(f"{prefix}: {_fit_text(content, 200)}")
+        if role == "assistant":
+            prefix = "Альта"
+        elif msg_user_id == user_id:
+            prefix = "Пользователь"
+        else:
+            # Clearly mark other participants so LLM doesn't attribute their words to our user
+            prefix = "Другой участник чата"
+        context_lines.append(f"{prefix}: {_fit_text(content, 180)}")
 
+    context_lines = context_lines[-5:]  # keep last 5 context messages
     if not context_lines:
         return input_text
 
-    context_block = "\n".join(context_lines[-4:])
-    return f"Контекст диалога:\n{context_block}\n\nТекущее сообщение пользователя:\n{input_text}"
+    context_block = "\n".join(context_lines)
+    return (
+        f"Контекст диалога (для понимания темы):\n{context_block}\n\n"
+        f"Сообщение пользователя (извлекать факты ТОЛЬКО из него):\n{input_text}"
+    )
 
 
 async def _background_extraction(
@@ -2545,6 +3212,7 @@ async def run_agent(
     history_limit: int,
     has_attachments: bool = False,
     debug_traces: bool = False,
+    enable_background_extraction: bool = True,
     creator_user_id: int | None = None,
     creator_profile_path: str = "./creator_profile.json",
     sender_username: str | None = None,
@@ -2673,6 +3341,10 @@ async def run_agent(
 
         if _is_repeated_recent_reply(answer, recent_assistant_replies):
             answer = _repeat_guard_hard_fallback(input_text)
+
+    grounded_now_answer = _deterministic_now_answer(input_text)
+    if grounded_now_answer:
+        answer = grounded_now_answer
 
     if ask_intro:
         intro_line = ""
@@ -2811,15 +3483,16 @@ async def run_agent(
         )
         await db.conn.commit()
 
-    # Schedule heavy extraction (memory, profile, summary) in background
-    task = asyncio.create_task(
-        _background_extraction(
-            llm, db, chat_id, user_id, input_text, history_limit,
-            sender_username, sender_first_name, sync_stats,
-            turn_id=turn_id, turn_metrics=turn_metrics,
+    if enable_background_extraction:
+        # Schedule heavy extraction (memory, profile, summary) in background
+        task = asyncio.create_task(
+            _background_extraction(
+                llm, db, chat_id, user_id, input_text, history_limit,
+                sender_username, sender_first_name, sync_stats,
+                turn_id=turn_id, turn_metrics=turn_metrics,
+            )
         )
-    )
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
     return answer

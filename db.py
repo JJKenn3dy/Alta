@@ -293,6 +293,10 @@ class DB:
             await self.conn.execute(
                 "ALTER TABLE user_profiles ADD COLUMN approved_display_name TEXT"
             )
+        if "extra_fields" not in user_profile_columns:
+            await self.conn.execute(
+                "ALTER TABLE user_profiles ADD COLUMN extra_fields TEXT NOT NULL DEFAULT '{}'"
+            )
 
         await self.conn.execute(
             "CREATE TABLE IF NOT EXISTS pending_name_approvals ("
@@ -604,12 +608,109 @@ class DB:
         assert self.conn
         cur = await self.conn.execute(
             "SELECT display_name,nickname,approved_display_name,gender,interests,communication_style,"
-            "response_preference,relationship_notes,profile_confidence,updated_at "
+            "response_preference,relationship_notes,profile_confidence,extra_fields,updated_at "
             "FROM user_profiles WHERE chat_id=? AND user_id=?",
             (chat_id, user_id),
         )
         row = await cur.fetchone()
         return dict(row) if row else {}
+
+    async def get_user_profile_merged(self, chat_id: int, user_id: int) -> dict:
+        """Return user profile merging group-specific data with private-chat profile.
+
+        Private chat profile is stored under (user_id, user_id) and represents
+        explicitly user-set values — they ALWAYS take priority over auto-extracted
+        group data.  Group profile fills in what the user hasn't set manually.
+        """
+        import json
+
+        group_profile = await self.get_user_profile(chat_id, user_id)
+
+        # If already querying private chat profile, no merge needed
+        if chat_id == user_id:
+            return group_profile
+
+        private_profile = await self.get_user_profile(user_id, user_id)
+        if not private_profile:
+            return group_profile
+        if not group_profile:
+            return private_profile
+
+        # Base = group profile (auto-extracted); private profile OVERRIDES it field-by-field.
+        # This ensures manually set values always win over LLM-extracted ones.
+        merged = dict(group_profile)
+        for key, value in private_profile.items():
+            if value not in (None, "", "{}"):
+                merged[key] = value
+
+        # Merge extra_fields JSON: private overrides group per-key
+        try:
+            private_extra = json.loads(private_profile.get("extra_fields") or "{}") if isinstance(private_profile.get("extra_fields"), str) else (private_profile.get("extra_fields") or {})
+            group_extra = json.loads(group_profile.get("extra_fields") or "{}") if isinstance(group_profile.get("extra_fields"), str) else (group_profile.get("extra_fields") or {})
+            merged_extra = {**group_extra, **private_extra}  # private overrides group
+            merged["extra_fields"] = json.dumps(merged_extra, ensure_ascii=False) if merged_extra else "{}"
+        except Exception:
+            pass
+
+        return merged
+
+    async def get_all_group_profiles_merged(self, user_id: int) -> dict:
+        """Return a merged profile built from all GROUP chats for this user.
+
+        Group chats are any chat where chat_id != user_id.
+        Higher profile_confidence rows take priority field-by-field.
+        """
+        import json
+
+        assert self.conn
+        cur = await self.conn.execute(
+            "SELECT display_name,nickname,approved_display_name,gender,interests,communication_style,"
+            "response_preference,relationship_notes,profile_confidence,extra_fields "
+            "FROM user_profiles WHERE user_id=? AND chat_id!=? "
+            "ORDER BY profile_confidence DESC, updated_at DESC",
+            (user_id, user_id),
+        )
+        rows = await cur.fetchall()
+        if not rows:
+            return {}
+
+        # Merge all rows: first non-empty value per field wins (rows sorted by confidence desc)
+        text_fields = (
+            "display_name", "nickname", "approved_display_name", "gender",
+            "interests", "communication_style", "response_preference", "relationship_notes",
+        )
+        merged: dict = {}
+        merged_extra: dict = {}
+        best_confidence = 0.0
+
+        for row in rows:
+            r = dict(row)
+            best_confidence = max(best_confidence, r.get("profile_confidence") or 0.0)
+            for f in text_fields:
+                if not merged.get(f) and r.get(f):
+                    merged[f] = r[f]
+            # Merge extra_fields JSON
+            try:
+                extra = json.loads(r.get("extra_fields") or "{}") if isinstance(r.get("extra_fields"), str) else {}
+                for k, v in extra.items():
+                    if k not in merged_extra and v:
+                        merged_extra[k] = v
+            except Exception:
+                pass
+
+        merged["profile_confidence"] = best_confidence
+        merged["extra_fields"] = json.dumps(merged_extra, ensure_ascii=False) if merged_extra else "{}"
+        return merged
+
+    async def count_user_facts_global(self, user_id: int) -> int:
+        """Count all user_facts for this user across all group chats."""
+        assert self.conn
+        cur = await self.conn.execute(
+            "SELECT COUNT(*) FROM user_facts WHERE user_id=? AND chat_id!=?",
+            (user_id, user_id),
+        )
+        row = await cur.fetchone()
+        return int(row[0]) if row else 0
 
     async def get_user_document(self, chat_id: int, user_id: int) -> dict:
         assert self.conn
@@ -654,14 +755,15 @@ class DB:
         response_preference: str | None = None,
         relationship_notes: str | None = None,
         profile_confidence: float | None = None,
+        extra_fields: str | None = None,
     ):
         assert self.conn
         current = await self.get_user_profile(chat_id, user_id)
         await self.conn.execute(
             "INSERT INTO user_profiles("
             "chat_id,user_id,display_name,nickname,approved_display_name,gender,interests,communication_style,"
-            "response_preference,relationship_notes,profile_confidence"
-            ") VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+            "response_preference,relationship_notes,profile_confidence,extra_fields"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(chat_id,user_id) DO UPDATE SET "
             "display_name=excluded.display_name,"
             "nickname=excluded.nickname,"
@@ -672,6 +774,7 @@ class DB:
             "response_preference=excluded.response_preference,"
             "relationship_notes=excluded.relationship_notes,"
             "profile_confidence=excluded.profile_confidence,"
+            "extra_fields=excluded.extra_fields,"
             "updated_at=datetime('now')",
             (
                 chat_id,
@@ -695,6 +798,7 @@ class DB:
                 profile_confidence
                 if profile_confidence is not None
                 else current.get("profile_confidence", 0.0),
+                extra_fields if extra_fields is not None else current.get("extra_fields", "{}"),
             ),
         )
         await self.conn.commit()

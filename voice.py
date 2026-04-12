@@ -32,7 +32,7 @@ DIRECT_VOICE_PATTERNS = (
         re.IGNORECASE,
     ),
     re.compile(
-        f"^(?:\u0441\u043a\u0430\u0436\u0438|\u043f\u0440\u043e\u0438\u0437\u043d\u0435\u0441\u0438)\\s+"
+        f"^(?:\u043f\u0440\u043e\u0438\u0437\u043d\u0435\u0441\u0438)\\s+"
         f"(?:\u043c\u043d\u0435\\s+)?{VOICE_MARKER_PART}(?:\\s*(?::|-|,)\\s*|\\s+)(?P<content>.+)$",
         re.IGNORECASE,
     ),
@@ -44,7 +44,7 @@ DIRECT_VOICE_PATTERNS = (
 
 VOICE_REPLY_PREFIX_PATTERNS = (
     re.compile(
-        f"^(?:\u043e\u0442\u0432\u0435\u0442\u044c|\u0440\u0430\u0441\u0441\u043a\u0430\u0436\u0438|"
+        f"^(?:\u043e\u0442\u0432\u0435\u0442\u044c|\u0441\u043a\u0430\u0436\u0438|\u0440\u0430\u0441\u0441\u043a\u0430\u0436\u0438|"
         f"\u043e\u0431\u044a\u044f\u0441\u043d\u0438|\u043f\u0440\u043e\u043a\u043e\u043c\u043c\u0435\u043d\u0442\u0438\u0440\u0443\u0439)"
         f"(?:\\s+\u043c\u043d\u0435)?\\s+{VOICE_MARKER_PART}"
         f"(?:\\s*(?::|-|,)\\s*|\\s*)(?P<content>.*)$",
@@ -61,7 +61,7 @@ VOICE_REPLY_SUFFIX_PATTERNS = (
     re.compile(
         f"^(?P<content>.+?)"
         f"(?:\\s*(?:,|:|-)\\s*|\\s+)"
-        f"(?:(?:\u043e\u0442\u0432\u0435\u0442\u044c|\u0440\u0430\u0441\u0441\u043a\u0430\u0436\u0438|"
+        f"(?:(?:\u043e\u0442\u0432\u0435\u0442\u044c|\u0441\u043a\u0430\u0436\u0438|\u0440\u0430\u0441\u0441\u043a\u0430\u0436\u0438|"
         f"\u043e\u0431\u044a\u044f\u0441\u043d\u0438|\u043f\u0440\u043e\u043a\u043e\u043c\u043c\u0435\u043d\u0442\u0438\u0440\u0443\u0439)\\s+)?"
         f"{VOICE_MARKER_PART}$",
         re.IGNORECASE,
@@ -112,7 +112,7 @@ def _looks_like_voice_reply_request(text: str) -> bool:
     if re.search(
         (
             "(?:^|\\s)"
-            "(?:\u043e\u0442\u0432\u0435\u0442\u044c|\u0440\u0430\u0441\u0441\u043a\u0430\u0436\u0438|"
+            "(?:\u043e\u0442\u0432\u0435\u0442\u044c|\u0441\u043a\u0430\u0436\u0438|\u0440\u0430\u0441\u0441\u043a\u0430\u0436\u0438|"
             "\u043e\u0431\u044a\u044f\u0441\u043d\u0438|\u043f\u0440\u043e\u043a\u043e\u043c\u043c\u0435\u043d\u0442\u0438\u0440\u0443\u0439)"
             "(?:\\s|$)"
         ),
