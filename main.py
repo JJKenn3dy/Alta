@@ -16,26 +16,44 @@ log = logging.getLogger("alta")
 _SHUTDOWN_EVENT: asyncio.Event | None = None
 _BOT_SLEEP_KEY = "bot_sleep_at"
 
-_SLEEP_PHRASES = [
+_SLEEP_FALLBACKS = [
     "ладно, всё, сплю. пока",
     "ухожу спать. не трогайте",
     "вырубаюсь. до завтра",
     "всё, отключаюсь. спокойной ночи",
     "спать пошла. пока всем",
-    "всё на сегодня. сплю",
 ]
 
+_WAKE_FALLBACKS = [
+    "вернулась",
+    "снова тут",
+    "доброе утро",
+    "всем привет",
+]
 
-def _wake_phrase(hours: float) -> str:
-    if hours < 1.5:
-        return "ненадолго отходила. снова тут"
+_SLEEP_LLM_PROMPT = """Ты — Альта, молодая девушка ~20 лет в групповом чате.
+Напиши одну короткую живую фразу по-русски: говоришь чату что уходишь спать.
+До 10 слов. Без эмодзи. Разговорный стиль, не шаблонный.
+Верни только саму фразу."""
+
+_WAKE_LLM_PROMPT = """Ты — Альта, молодая девушка ~20 лет в групповом чате.
+Ты вернулась после {hours_desc} отсутствия.
+Напиши одну короткую живую фразу по-русски: говоришь что вернулась.
+Учитывай сколько прошло времени — была ли это короткая пауза или долгий сон.
+До 12 слов. Без эмодзи. Разговорный стиль.
+Верни только саму фразу."""
+
+
+def _hours_desc(hours: float) -> str:
+    if hours < 1:
+        return "меньше часа"
+    if hours < 2:
+        return "около часа"
     if hours < 5:
-        return "вернулась"
-    if hours < 10:
-        return "доброе утро. выспалась"
+        return f"{int(hours)} часа"
     if hours < 20:
-        return "добрый день. давно не виделась с вами"
-    return "всем привет. давно меня не было"
+        return f"{int(hours)} часов"
+    return f"больше суток"
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatType
@@ -650,7 +668,17 @@ async def main():
                 sleep_dt = sleep_dt.replace(tzinfo=timezone.utc)
             hours_slept = (datetime.now(timezone.utc) - sleep_dt).total_seconds() / 3600.0
             if hours_slept >= 0.5:
-                wake_msg = _wake_phrase(hours_slept)
+                try:
+                    raw = await llm.chat(
+                        system_prompt=_WAKE_LLM_PROMPT.format(hours_desc=_hours_desc(hours_slept)),
+                        messages=[{"role": "user", "content": "ты вернулась"}],
+                        temperature=0.9,
+                        top_p=cfg.top_p,
+                        max_tokens=55,
+                    )
+                    wake_msg = sanitize_outgoing_text((raw or "").strip()) or random.choice(_WAKE_FALLBACKS)
+                except Exception:
+                    wake_msg = random.choice(_WAKE_FALLBACKS)
                 active_chats = await db.get_active_chat_ids()
                 for cid in active_chats:
                     try:
@@ -1130,7 +1158,17 @@ async def main():
         if text.strip().lower() in ("/sleep", "/sleep@" + bot_username.lower()):
             if cfg.creator_user_id is None or user_id != cfg.creator_user_id:
                 return
-            sleep_phrase = random.choice(_SLEEP_PHRASES)
+            try:
+                raw = await llm.chat(
+                    system_prompt=_SLEEP_LLM_PROMPT,
+                    messages=[{"role": "user", "content": "уходишь спать"}],
+                    temperature=0.9,
+                    top_p=cfg.top_p,
+                    max_tokens=50,
+                )
+                sleep_phrase = sanitize_outgoing_text((raw or "").strip()) or random.choice(_SLEEP_FALLBACKS)
+            except Exception:
+                sleep_phrase = random.choice(_SLEEP_FALLBACKS)
             active_chats = await db.get_active_chat_ids()
             now_iso = datetime.now(timezone.utc).isoformat()
             await db.set_bot_kv(_BOT_SLEEP_KEY, now_iso)
@@ -1139,7 +1177,7 @@ async def main():
                     await bot.send_message(cid, sleep_phrase)
                 except Exception:
                     log.debug("sleep: failed to send message to chat=%s", cid, exc_info=True)
-            log.info("sleep: shutdown requested by user=%s", user_id)
+            log.info("sleep: shutdown requested by user=%s phrase=%r", user_id, sleep_phrase)
             if _SHUTDOWN_EVENT is not None:
                 _SHUTDOWN_EVENT.set()
             return
