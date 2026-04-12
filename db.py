@@ -213,7 +213,7 @@ class DB:
         await self._migrate_schema()
         await self._cleanup_identity_noise()
         await self.conn.commit()
-        await self.prune_debug_traces(keep=500)
+        await self.prune_debug_traces(keep=30)
 
     async def _migrate_schema(self):
         assert self.conn
