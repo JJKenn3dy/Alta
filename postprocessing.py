@@ -41,7 +41,6 @@ FORBIDDEN_SELF_REFERENCE_PATTERNS = (
 OVER_PERSONA_STRONG_PATTERNS = (
     re.compile(r"[!?]{3,}"),
     re.compile(r"\*[^*]{1,80}\*"),
-    re.compile(r"([а-яё])\1{3,}", re.IGNORECASE),
 )
 OVER_PERSONA_SOFT_PATTERNS = (
     re.compile(r"\b(?:с удовольствием|буду рада помочь|всегда к услугам)\b", re.IGNORECASE),
@@ -145,6 +144,16 @@ def _contains_emoji(text: str) -> bool:
     return bool(EMOJI_PATTERN.search(text or ""))
 
 
+def _limit_emoji(text: str, max_count: int = 2) -> str:
+    """Keep at most max_count emoji, remove the rest."""
+    found = 0
+    def _replacer(m: re.Match) -> str:
+        nonlocal found
+        found += 1
+        return m.group(0) if found <= max_count else ""
+    return EMOJI_PATTERN.sub(_replacer, text or "")
+
+
 def _has_forbidden_self_reference(text: str) -> bool:
     value = _normalize_reply_text(text)
     if not value:
@@ -157,8 +166,6 @@ def _has_format_violation(text: str) -> bool:
     if not raw:
         return False
     value = _normalize_reply_text(raw)
-    if _contains_emoji(value):
-        return True
     if _has_forbidden_self_reference(value):
         return True
     if len(value) > MAX_EDITOR_REPLY_CHARS:
@@ -254,7 +261,7 @@ def _deterministic_postprocess_answer(draft_answer: str) -> str:
     value = _strip_list_prefixes(raw) if "\n" in raw or LIST_PREFIX_PATTERN.search(raw) else raw
     value = _SEARCH_RE.sub("", value).strip()
     value = re.sub(r"^\[\d{1,2}:\d{2}\]\s*", "", value)
-    value = EMOJI_PATTERN.sub("", value)
+    value = _limit_emoji(value, max_count=2)
     value = re.sub(r"\s*[—–]\s*", " - ", value)
     value = re.sub(r"[ \t]+", " ", value)
     value = re.sub(r"\s*([,.:;!?])\s*", r"\1 ", value)
@@ -267,7 +274,6 @@ def _deterministic_postprocess_answer(draft_answer: str) -> str:
 
     if _has_over_persona(value):
         value = re.sub(r"\*[^*]{1,80}\*", "", value)
-        value = re.sub(r"([А-Яа-яЁё])\1{3,}", r"\1\1", value, flags=re.IGNORECASE)
         value = re.sub(r"[!?]{3,}", "!!", value)
         value = _normalize_reply_text(value)
 

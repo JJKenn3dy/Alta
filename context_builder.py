@@ -56,14 +56,18 @@ USER_PREFIX_ID_PATTERN = re.compile(r"\[[^\]]*\bid=(\d+)\b", re.IGNORECASE)
 # ---------------------------------------------------------------------------
 _SIGNAL_AGGRESSION = (
     re.compile(
-        r"\b(иди\s+нахуй|иди\s+нафиг|пошла?\s+нахуй|заткнись|ты\s+тупая?|дура\b|идиот\b"
-        r"|ублюдок|дебил|мразь|тварь|бесишь|надоела)\b",
+        r"\b(иди\s+нахуй|иди\s+нафиг|пошла?\s+нахуй|заткнись|ты\s+тупая?"
+        r"|ублюдок|мразь|тварь|бесишь|надоела)\b",
         re.IGNORECASE,
     ),
     re.compile(
         r"\b(shut\s*up|fuck\s+you|go\s+fuck|you\s+suck|fuck\s+off)\b",
         re.IGNORECASE,
     ),
+)
+# Ambiguous words — часто используются по-дружески в русском чате
+_SIGNAL_AGGRESSION_WEAK = (
+    re.compile(r"\b(дура\b|дебил\b|идиот\b)\b", re.IGNORECASE),
 )
 _SIGNAL_GRATITUDE = (
     re.compile(r"\b(спасибо|спс|благодарю|thanks?|thank\s+you)\b", re.IGNORECASE),
@@ -437,27 +441,33 @@ def compute_state_updates(
     """
     text = str(input_text or "")
     aggression = 1.0 if any(p.search(text) for p in _SIGNAL_AGGRESSION) else 0.0
+    aggression_weak = 0.4 if (not aggression and any(p.search(text) for p in _SIGNAL_AGGRESSION_WEAK)) else 0.0
     gratitude = 1.0 if any(p.search(text) for p in _SIGNAL_GRATITUDE) else 0.0
     creative = 1.0 if any(p.search(text) for p in _SIGNAL_CREATIVE) else 0.0
     has_question = "?" in text
 
+    # Scale aggression effect down for trusted users — "дура" from a friend hurts less
+    trust = float(user_relation.get("trust", 0.5))
+    trust_discount = 1.0 - trust * 0.5  # 1.0 at trust=0, 0.5 at trust=1.0
+    agg = (aggression + aggression_weak) * trust_discount
+
     # Chat state
     new_chat = {
         "energy": _clamp(
-            float(chat_state.get("energy", 0.7)) - 0.015 - aggression * 0.03 + creative * 0.01
+            float(chat_state.get("energy", 0.7)) - 0.015 - agg * 0.03 + creative * 0.01
         ),
         "irritation": _clamp(
-            float(chat_state.get("irritation", 0.0)) + aggression * 0.12 - 0.015
+            float(chat_state.get("irritation", 0.0)) + agg * 0.12 - 0.015
         ),
         "playfulness": min(0.9, _clamp(
             float(chat_state.get("playfulness", 0.5))
             + creative * 0.06
-            - aggression * 0.05
+            - agg * 0.05
         )),
         "social_battery": _clamp(
             float(chat_state.get("social_battery", 0.8))
             - 0.02
-            - aggression * 0.06
+            - agg * 0.06
         ),
     }
 
@@ -465,17 +475,17 @@ def compute_state_updates(
     prev_annoyance = float(user_relation.get("annoyance", 0.0))
     new_rel = {
         "trust": min(0.85, _clamp(
-            float(user_relation.get("trust", 0.5))
-            + (0.02 if not aggression else -0.03)
+            trust
+            + (0.02 if not aggression else -0.03 * trust_discount)
             + gratitude * 0.015
         )),
         "warmth": _clamp(
             float(user_relation.get("warmth", 0.5))
             + gratitude * 0.05
-            - aggression * 0.05
+            - agg * 0.05
         ),
-        "caution": min(0.75, _clamp(float(user_relation.get("caution", 0.0)) + aggression * 0.05)),
-        "annoyance": _clamp(prev_annoyance + aggression * 0.15 - 0.01),
+        "caution": min(0.75, _clamp(float(user_relation.get("caution", 0.0)) + agg * 0.05)),
+        "annoyance": _clamp(prev_annoyance + agg * 0.15 - 0.01),
         "interaction_count": int(user_relation.get("interaction_count", 0)) + 1,
     }
 
