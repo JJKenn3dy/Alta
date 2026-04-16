@@ -1,7 +1,7 @@
 import unittest
 
 try:
-    from main import _join_verification_ban_kwargs
+    from moderation import _join_verification_ban_kwargs
 except Exception as exc:  # pragma: no cover - import guard for optional deps
     _join_verification_ban_kwargs = None
     IMPORT_ERROR = exc

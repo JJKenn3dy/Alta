@@ -33,7 +33,7 @@ from telemetry import approx_messages_tokens, approx_text_tokens
 # ---------------------------------------------------------------------------
 CONTEXT_HISTORY_LIMIT = 15
 SUMMARY_CONTEXT_CHAR_LIMIT = 700
-HISTORY_MESSAGE_CHAR_LIMIT = 900
+HISTORY_MESSAGE_CHAR_LIMIT = 1200
 DEFAULT_CONTEXT_CHAR_BUDGET = 12_000
 COMPACT_CONTEXT_CHAR_BUDGET = 7_000
 MINIMAL_CONTEXT_CHAR_BUDGET = 3_500
@@ -454,7 +454,7 @@ def compute_state_updates(
     # Chat state
     new_chat = {
         "energy": _clamp(
-            float(chat_state.get("energy", 0.7)) - 0.015 - agg * 0.03 + creative * 0.01
+            float(chat_state.get("energy", 0.7)) - 0.003 - agg * 0.03 + creative * 0.01
         ),
         "irritation": _clamp(
             float(chat_state.get("irritation", 0.0)) + agg * 0.12 - 0.015
@@ -466,7 +466,7 @@ def compute_state_updates(
         )),
         "social_battery": _clamp(
             float(chat_state.get("social_battery", 0.8))
-            - 0.02
+            - 0.005
             - agg * 0.06
         ),
     }
@@ -820,12 +820,19 @@ async def build_context(
     mention_only: bool = False,
     reply_context=None,
     creator_user_id: int | None = None,
-) -> tuple[list[dict[str, str]], list[dict], dict[str, int]]:
+    *,
+    user_profile: dict | None = None,
+    user_facts: list | None = None,
+    user_document: dict | None = None,
+) -> tuple[list[dict[str, str]], list[dict], dict[str, int], dict]:
     summary = await db.get_summary(chat_id)
     speaker_summary = await db.get_summary(chat_id, user_id)
-    user_facts = await db.get_user_facts(chat_id, user_id, limit=80)  # FACT_KEEP_PER_USER
-    user_profile = await db.get_user_profile_merged(chat_id, user_id)
-    user_document = await db.get_user_document(chat_id, user_id)
+    if user_facts is None:
+        user_facts = await db.get_user_facts(chat_id, user_id, limit=80)  # FACT_KEEP_PER_USER
+    if user_profile is None:
+        user_profile = await db.get_user_profile_merged(chat_id, user_id)
+    if user_document is None:
+        user_document = await db.get_user_document(chat_id, user_id)
     focused_history = await db.get_last_messages(
         chat_id,
         min(history_limit, max(plan.history_messages * 2, 12)),
@@ -977,7 +984,7 @@ async def build_context(
             if file_block:
                 system_blocks.append({"content": file_block, "bucket": "rag", "label": "rag"})
 
-    # Alta internal state: load → decay → update → save → block
+    # Alta internal state: load → decay → compute (writes deferred to background)
     chat_state_raw = await db.get_alta_chat_state(chat_id)
     user_rel_raw = await db.get_alta_user_relation(chat_id, user_id)
     hours_chat = _hours_since_state(chat_state_raw.get("updated_at"))
@@ -996,31 +1003,33 @@ async def build_context(
             "caution": 0.0,
             "annoyance": 0.0,
         }
-    await db.save_alta_chat_state(
-        chat_id,
-        energy=new_chat_state["energy"],
-        irritation=new_chat_state["irritation"],
-        playfulness=new_chat_state["playfulness"],
-        social_battery=new_chat_state["social_battery"],
-    )
-    await db.save_alta_user_relation(
-        chat_id, user_id,
-        trust=new_user_rel["trust"],
-        warmth=new_user_rel["warmth"],
-        caution=new_user_rel["caution"],
-        annoyance=new_user_rel["annoyance"],
-        interaction_count=new_user_rel["interaction_count"],
-    )
-    if reaction_kind:
-        await db.add_alta_reaction(
-            chat_id, reaction_kind, reaction_strength,
-            ttl_messages=2, target_user_id=user_id,
-        )
-    await db.tick_alta_reactions(chat_id)
+    # Read active reaction (pre-tick, at most 1 turn stale — acceptable for TTL=2)
     active_reaction = await db.get_active_alta_reaction(chat_id, user_id)
     state_block = build_alta_state_block(new_chat_state, new_user_rel, active_reaction)
     if state_block:
         system_blocks.append({"content": state_block, "bucket": "state", "label": "alta_state"})
+
+    # Fresh-session guard: if there's been a significant gap since last interaction,
+    # explicitly tell Alta not to proactively surface old topics/conflicts.
+    _SESSION_GAP_THRESHOLD_HOURS = 4.0
+    if hours_rel >= _SESSION_GAP_THRESHOLD_HOURS:
+        if hours_rel >= 48:
+            gap_label = f"{int(round(hours_rel / 24))} дн."
+        elif hours_rel >= 24:
+            gap_label = "больше суток"
+        elif hours_rel >= 1:
+            gap_label = f"{int(hours_rel)} ч."
+        else:
+            gap_label = f"{int(hours_rel * 60)} мин."
+        system_blocks.append({
+            "content": (
+                f"[Прошло {gap_label} с последнего сообщения — человек пишет снова. "
+                "Встречай свежо. Не поднимай сама прошлые темы, недосказанности или конфликты — "
+                "особенно если они были давно. Реагируй только на то, что написано сейчас.]"
+            ),
+            "bucket": "state",
+            "label": "session_gap",
+        })
 
     log.info(
         "mood  chat=%s user=%s | "
@@ -1066,4 +1075,46 @@ async def build_context(
         ),
     }
 
-    return [item for item in system_blocks if item.get("content")], prompt_history, context_metrics
+    mood_pending = {
+        "new_chat_state": new_chat_state,
+        "new_user_rel": new_user_rel,
+        "reaction_kind": reaction_kind,
+        "reaction_strength": reaction_strength,
+    }
+    return [item for item in system_blocks if item.get("content")], prompt_history, context_metrics, mood_pending
+
+
+# ---------------------------------------------------------------------------
+# Mood state persistence (called in background after reply is sent)
+# ---------------------------------------------------------------------------
+
+async def _save_mood_state(db, chat_id: int, user_id: int, mood_pending: dict) -> None:
+    """Persist computed mood state to DB — runs in background, off the hot path."""
+    try:
+        new_chat_state = mood_pending["new_chat_state"]
+        new_user_rel = mood_pending["new_user_rel"]
+        reaction_kind = mood_pending.get("reaction_kind")
+        reaction_strength = mood_pending.get("reaction_strength", 0.5)
+        await db.save_alta_chat_state(
+            chat_id,
+            energy=new_chat_state["energy"],
+            irritation=new_chat_state["irritation"],
+            playfulness=new_chat_state["playfulness"],
+            social_battery=new_chat_state["social_battery"],
+        )
+        await db.save_alta_user_relation(
+            chat_id, user_id,
+            trust=new_user_rel["trust"],
+            warmth=new_user_rel["warmth"],
+            caution=new_user_rel["caution"],
+            annoyance=new_user_rel["annoyance"],
+            interaction_count=new_user_rel["interaction_count"],
+        )
+        if reaction_kind:
+            await db.add_alta_reaction(
+                chat_id, reaction_kind, reaction_strength,
+                ttl_messages=2, target_user_id=user_id,
+            )
+        await db.tick_alta_reactions(chat_id)
+    except Exception:
+        log.warning("_save_mood_state failed chat=%s user=%s", chat_id, user_id, exc_info=True)

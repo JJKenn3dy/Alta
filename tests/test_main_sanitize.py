@@ -1,7 +1,7 @@
 import unittest
 
 try:
-    from main import sanitize_outgoing_text
+    from sanitization import sanitize_outgoing_text
 except Exception as exc:  # pragma: no cover - import guard for optional deps
     sanitize_outgoing_text = None
     IMPORT_ERROR = exc
@@ -9,7 +9,7 @@ else:
     IMPORT_ERROR = None
 
 
-@unittest.skipIf(sanitize_outgoing_text is None, f"failed to import main: {IMPORT_ERROR}")
+@unittest.skipIf(sanitize_outgoing_text is None, f"failed to import sanitization: {IMPORT_ERROR}")
 class MainSanitizeTests(unittest.TestCase):
     def test_strips_leading_target_marker(self):
         self.assertEqual(

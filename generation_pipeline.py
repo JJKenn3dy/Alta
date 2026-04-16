@@ -628,19 +628,24 @@ async def _generate_answer_with_fallback(
     knowledge_max_file_bytes: int,
     mention_only: bool = False,
     reply_context=None,
+    user_profile: dict | None = None,
+    user_facts: list | None = None,
+    user_document: dict | None = None,
     turn_id: str | None = None,
     turn_metrics=None,
-) -> tuple[str, str, list[dict], list[dict], bool]:
+) -> tuple[str, str, list[dict], list[dict], dict, bool]:
     last_overflow: Exception | None = None
     search_done = False
+    last_mood_pending: dict = {}
 
     for plan in _build_context_plans(max_tokens, history_limit):
-        system_blocks, filtered, context_metrics = await build_context(
+        system_blocks, filtered, context_metrics, last_mood_pending = await build_context(
             db, chat_id, user_id, history_limit,
             sender_username, sender_first_name,
             plan, knowledge_dir, knowledge_max_files, knowledge_max_file_bytes,
             input_text, mention_only, reply_context,
             creator_user_id=creator_user_id,
+            user_profile=user_profile, user_facts=user_facts, user_document=user_document,
         )
         system_prompt, prompt_metrics = _compose_system_prompt(
             input_text, user_id, creator_user_id, creator_profile_path,
@@ -694,7 +699,7 @@ async def _generate_answer_with_fallback(
                         answer = ""
                     if not answer.strip():
                         continue
-            return answer, system_prompt, filtered, system_blocks, False
+            return answer, system_prompt, filtered, system_blocks, last_mood_pending, False
         except ContextOverflowError as e:
             last_overflow = e
             log.warning("context overflow on plan=%s, retrying", plan.name)
@@ -732,7 +737,7 @@ async def _generate_answer_with_fallback(
                     "creator_profile_tokens": 0,
                 }
             )
-        return fallback_answer, fallback_system, fallback_messages, [], True
+        return fallback_answer, fallback_system, fallback_messages, [], last_mood_pending, True
     except ContextOverflowError as e:
         last_overflow = e
 

@@ -43,6 +43,31 @@ USER_DOCUMENT_FACT_LIMIT = 20
 # Mirror of CONTEXT_HISTORY_LIMIT from context_builder — used in summary cadence.
 _CONTEXT_HISTORY_LIMIT = 15
 
+# Стоп-паттерны для значений фактов: ролевые игры, эротика, БДСМ-терминология
+_FACT_VALUE_STOP_PATTERNS = (
+    re.compile(
+        r"\b(slave|master|rabb|рабын|господин|госпожа|bdsm|bddsm|фетиш|fetish"
+        r"|striptiz|стриптиз|проститут|escort|порно|porno|секс\s*клуб|sex\s*club"
+        r"|leather\s*(club|head)|онлифанс|onlyfans|интим|erotic|эротик"
+        r"|флирт\s*клуб|roleplay|ролевая\s*игра)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(sexual|intimacy|finger|penis|vagina|анал|оральн|cunni|fellat"
+        r"|gay\s*(website|club|bar)|genitalia)\b",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _is_toxic_fact_value(value: str) -> bool:
+    """Return True if fact value contains roleplay/erotic/BDSM garbage."""
+    for pattern in _FACT_VALUE_STOP_PATTERNS:
+        if pattern.search(value):
+            return True
+    return False
+
+
 INVALID_IDENTITY_VALUES = {
     "ты", "тебя", "тебе", "твой", "твоя", "он", "она", "они",
     "неизвестно", "неизвестен", "неизвестна", "неопределено", "не определено",
@@ -120,12 +145,13 @@ MEMORY_EXTRACT_PROMPT = """
 - Если в контексте есть "Другой участник чата" — его факты НЕЛЬЗЯ приписывать нашему пользователю.
 - Если пользователь говорит о ком-то другом ("мой друг любит...", "она занимается...") — это НЕ его факт.
 - Если пользователь говорит о боте/тебе ("ты красивая", "я тебя люблю", "ты моя роботка") — это НЕ факт о пользователе, не записывай.
-- Только личные факты и предпочтения, которые пригодятся позже.
+- СТРОГО ЗАПРЕЩЕНО извлекать факты из: ролевых игр (roleplay), флирта, провокационных или эротических заявлений, шуток про секс/БДСМ/рабство, троллинга, мемов. Если сообщение содержит подобное — верни [].
+- Только реальные, серьёзные личные факты из первого лица. Если непонятно — серьёзное это или шутка, не записывай.
 - Не извлекай имя, ник, пол, местоимения, стиль ответа и прочие identity-поля: они обрабатываются отдельно.
 - Используй только fact_type из набора: interest, preference, work, study, location, goal, bio, fact.
 - evidence: короткая цитата или опора из сообщения, максимум 120 символов.
 - importance от 0.0 до 1.0: 1.0 — факт стоит помнить очень долго; 0.0 — почти мусор.
-- Не сохраняй временные мелочи ("сейчас ем", "сегодня устал"), сиюминутные эмоции, мемные вбросы, троллинг, ролевые игры, эротические метафоры.
+- Не сохраняй временные мелочи ("сейчас ем", "сегодня устал"), сиюминутные эмоции, мемные вбросы.
 - Максимум 4 объекта.
 - confidence от 0.0 до 1.0.
 - Если извлекать нечего, верни [].
@@ -733,6 +759,9 @@ async def maybe_store_memories(
         value = _clean_fact_value(item.get("value"))
         if not value:
             continue
+        if _is_toxic_fact_value(value):
+            log.debug("fact value blocked by stop-pattern: %r", value[:80])
+            continue
         normalized_value = _normalize_fact_value(value).lower()
         try:
             confidence = float(item.get("confidence", 0.6))
@@ -932,12 +961,20 @@ async def sync_user_document(
     )
 
 
-async def should_ask_intro(db, chat_id: int, user_id: int, input_text: str) -> bool:
+async def should_ask_intro(
+    db,
+    chat_id: int,
+    user_id: int,
+    input_text: str,
+    *,
+    user_profile: dict | None = None,
+    user_document: dict | None = None,
+) -> bool:
     text = (input_text or "").strip()
     if _is_nonsemantic_input(text):
         return False
 
-    profile = await db.get_user_profile_merged(chat_id, user_id)
+    profile = user_profile if user_profile is not None else await db.get_user_profile_merged(chat_id, user_id)
     has_display_name = bool(
         (profile.get("approved_display_name") or profile.get("display_name") or "").strip()
     )
@@ -945,8 +982,8 @@ async def should_ask_intro(db, chat_id: int, user_id: int, input_text: str) -> b
     if has_display_name or has_nickname:
         return False
 
-    user_document = await db.get_user_document(chat_id, user_id)
-    if (user_document.get("document_text") or "").strip():
+    doc = user_document if user_document is not None else await db.get_user_document(chat_id, user_id)
+    if (doc.get("document_text") or "").strip():
         return False
 
     if await db.has_memory_key(chat_id, user_id, INTRO_MARKER_KEY):

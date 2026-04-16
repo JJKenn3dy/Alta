@@ -17,7 +17,7 @@ Alta — Telegram-бот с характером (AI-персонаж ~20 лет
 ```
 main.py             — точка входа, aiogram Dispatcher, все Telegram handlers
 agent.py            — оркестратор: re-export из суб-модулей, run_agent() точка входа
-context_builder.py  — сборка системного промпта (блоки), история, состояние Альты
+context_builder.py  — сборка системного промпта (блоки), история, состояние Альты; _save_mood_state()
 generation_pipeline.py — LLM генерация, web search, repeat rewrite, edit_answer
 memory_engine.py    — факты, профили, summary, background extraction
 postprocessing.py   — очистка ответа, repeat guard, gender fix, shrink
@@ -32,6 +32,9 @@ lore_context.py     — legacy helper загрузки лора; основно�
 profile_context.py  — загрузка creator_profile.json
 user_profile.py     — /profile команда: парсинг, валидация, CRUD полей профиля
 private_profile.py  — личный кабинет в ЛС бота: inline-меню, валидация, импорт из групп
+cooldowns.py        — CooldownManager, LockRegistry, per-chat locks, cooldown helpers
+moderation.py       — JoinVerification, join/unban логика, spam detection
+sanitization.py     — sanitize_incoming/outgoing_text, prompt injection protection, is_trigger
 router.py           — legacy роутер (mention/reply detection)
 telemetry.py        — JSONL логирование метрик в orchestration.log
 runtime_io.py       — UTF-8 reconfigure для Windows
@@ -45,7 +48,12 @@ tests/              — pytest тесты
 
 2. **Context overflow fallback**: 4 уровня контекста (full → compact → minimal → emergency). Если LLM не влезает в контекст, система автоматически уменьшает историю, память и RAG.
 
-3. **Фоновая extraction**: после отправки ответа пользователю, в фоне запускается `_background_extraction()` — LLM извлекает факты и обновляет профиль. Это НЕ блокирует ответ.
+3. **Фоновые задачи после ответа**: несколько операций намеренно запускаются ПОСЛЕ отправки ответа:
+   - `_background_extraction()` — LLM-извлечение фактов и обновление профиля
+   - `maybe_store_identity_from_telegram()` — сохранение username/first_name (1 ход позади — ok)
+   - `sync_user_document()` — обновление денормализованного кэша документа (1 ход позади — ok)
+   - `_save_mood_state()` — запись mood state в БД (вычислено синхронно, запись асинхронна)
+   Все задачи fire-and-forget через `_background_tasks` set в agent.py.
 
 4. **Промпт собирается из блоков**: system_blocks — список dict'ов с полями `content`, `bucket`, `label`. Bucket'ы: system, summary, memory, rag, state. Это позволяет мерить токены по категориям.
 
@@ -53,7 +61,7 @@ tests/              — pytest тесты
 
 6. **Постобработка ответа**: `_deterministic_postprocess_answer()` — удаление эмодзи, списков, "я бот", fix пола (мужской→женский).
 
-7. **Санитизация**: `sanitize_incoming_text()` и `sanitize_outgoing_text()` защищают от prompt injection (удаление `[id=... @user]` тегов, `system:` / `assistant:` префиксов).
+7. **Санитизация** (sanitization.py): `sanitize_incoming_text()` и `sanitize_outgoing_text()` защищают от prompt injection (удаление `[id=... @user]` тегов, `system:` / `assistant:` префиксов). Вынесено в отдельный модуль из main.py.
 
 8. **Двухуровневый профиль пользователя**:
    - Групповой профиль `(chat_id, user_id)` — авто-собирается LLM из сообщений в группе
@@ -66,8 +74,11 @@ tests/              — pytest тесты
     - `alta_chat_state` — фон чата: energy, irritation, playfulness, social_battery (per chat_id)
     - `alta_user_relation` — отношение к конкретному пользователю: trust, warmth, caution, annoyance (per chat_id+user_id)
     - `alta_reactions` — краткоживущие реакции с TTL (1–3 сообщения): amused, curious, annoyed, concerned, embarrassed
-    - Состояние обновляется на каждом ходу в `build_context()`: чтение → временное затухание → обновление по сигналам → сохранение → блок в промпт
+    - Hot path: `build_context()` читает → decay → вычисляет → строит блок, но НЕ пишет в БД
+    - Запись (`_save_mood_state()`) — background task после отправки ответа
     - LLM только выражает состояние в тоне — не называет его явно
+
+11. **Hot-path оптимизация DB**: `run_agent()` читает `user_profile`, `user_facts`, `user_document` один раз через `asyncio.gather()` и передаёт параметрами в `should_ask_intro()`, `build_context()`, `_generate_answer_with_fallback()`. На hot path нет повторных DB-reads для этих данных.
 
 ## Как запускать
 
@@ -91,6 +102,8 @@ pytest tests/
 - `MAX_EDITOR_REPLY_CHARS = 700` — макс. длина ответа (postprocessing.py)
 - `MAX_EDITOR_SENTENCES = 8` — ограничение по числу предложений (postprocessing.py)
 - `REPEAT_GUARD_WINDOW = 6` — окно для проверки повторений (postprocessing.py)
+- `HISTORY_MESSAGE_CHAR_LIMIT = 1200` — обрезка одного сообщения в истории (context_builder.py)
+- energy drain: `−0.003/msg`, social_battery drain: `−0.005/msg` — намеренно низкие (context_builder.py)
 
 ## База данных (основные таблицы)
 
@@ -151,15 +164,22 @@ pytest tests/
 - Числа не попадают в промпт — только человекочитаемые метки ("устала", "раздражена", "тепло")
 - Bucket `state`, label `alta_state`
 
+### Drain (context_builder.py)
+- energy: −0.003/msg (при агрессии дополнительно −0.03)
+- social_battery: −0.005/msg (при агрессии дополнительно −0.06)
+- Восстановление time-based: energy +0.08/час, social_battery +0.12/час
+
 ## Что НЕ трогать без понимания
 
-- `sanitize_incoming_text()` / `sanitize_outgoing_text()` — prompt injection protection
+- `sanitize_incoming_text()` / `sanitize_outgoing_text()` в sanitization.py — prompt injection protection
 - `_migrate_schema()` в db.py — автомиграции, добавлять новые в конец
 - `_fix_gender()` в postprocessing.py — regex'ы для gender fix, ломаются при неаккуратном изменении
-- `_pending_join_verification` в main.py — in-memory state верификации, race conditions
+- `_pending_join_verification` в moderation.py — in-memory state верификации, race conditions
 - `get_user_profile_merged()` в db.py — логика приоритета приватного профиля над групповым
 - `_build_extraction_text()` в memory_engine.py — разметка сообщений по owner'у, нельзя смешивать
 - `compute_state_updates()` в context_builder.py — детерминированная логика состояния, без LLM
+- `_save_mood_state()` / `_background_tasks` в agent.py — fire-and-forget pattern, не блокировать ответ
+- `_FACT_VALUE_STOP_PATTERNS` в memory_engine.py — постфильтр мусорных фактов (roleplay/эротика)
 
 ## Известные ограничения / TODO
 

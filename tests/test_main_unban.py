@@ -1,7 +1,7 @@
 import unittest
 
 try:
-    from main import UNBAN_COMMAND_RE, _can_restrict_members, _parse_unban_target_token
+    from moderation import UNBAN_COMMAND_RE, _can_restrict_members, _parse_unban_target_token
 except Exception as exc:  # pragma: no cover - import guard for optional deps
     UNBAN_COMMAND_RE = None
     _can_restrict_members = None

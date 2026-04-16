@@ -169,21 +169,31 @@ async def run_agent(
         turn_metrics.mode = mode
         turn_metrics.route_reason = routed_reason
 
-    # Fast DB-only ops before answer generation
-    sync_stats = await maybe_store_identity_from_telegram(
-        db, chat_id, user_id, sender_username, sender_first_name,
+    # Pre-load user data once — shared by should_ask_intro and build_context
+    user_profile, user_facts, user_document = await asyncio.gather(
+        db.get_user_profile_merged(chat_id, user_id),
+        db.get_user_facts(chat_id, user_id, limit=FACT_KEEP_PER_USER),
+        db.get_user_document(chat_id, user_id),
     )
-    await sync_user_document(db, chat_id, user_id, sender_username, sender_first_name)
-    ask_intro = await should_ask_intro(db, chat_id, user_id, input_text)
+
+    ask_intro = await should_ask_intro(
+        db, chat_id, user_id, input_text,
+        user_profile=user_profile, user_document=user_document,
+    )
+
+    # identity sync and doc rebuild run after the reply is sent — 1 turn behind is fine
+    sync_stats: dict[str, int] = {"memory_attempted": 0, "memory_changed": 0,
+                                   "profile_attempted": 0, "profile_changed": 0}
 
     # Generate answer FIRST — no LLM extraction blocking the response
-    answer, system_prompt, filtered, system_blocks, fallback_used = await _generate_answer_with_fallback(
+    answer, system_prompt, filtered, system_blocks, mood_pending, fallback_used = await _generate_answer_with_fallback(
         llm, db, chat_id, user_id, input_text,
         temperature, top_p, max_tokens, history_limit,
         creator_user_id, creator_profile_path,
         sender_username, sender_first_name,
         knowledge_dir, knowledge_max_files, knowledge_max_file_bytes,
         mention_only, reply_context,
+        user_profile=user_profile, user_facts=user_facts, user_document=user_document,
         turn_id=turn_id, turn_metrics=turn_metrics,
     )
     if turn_metrics is not None:
@@ -364,6 +374,26 @@ async def run_agent(
             (chat_id, input_text, json.dumps(trace_payload, ensure_ascii=False), answer),
         )
         await db.conn.commit()
+
+    # Mood state writes — deferred to background so they don't block the hot path
+    if mood_pending:
+        from context_builder import _save_mood_state
+        _bg_mood = asyncio.create_task(_save_mood_state(db, chat_id, user_id, mood_pending))
+        _background_tasks.add(_bg_mood)
+        _bg_mood.add_done_callback(_background_tasks.discard)
+
+    # Identity sync + document rebuild — 1 turn behind is acceptable
+    _bg_identity = asyncio.create_task(
+        maybe_store_identity_from_telegram(db, chat_id, user_id, sender_username, sender_first_name)
+    )
+    _background_tasks.add(_bg_identity)
+    _bg_identity.add_done_callback(_background_tasks.discard)
+
+    _bg_doc = asyncio.create_task(
+        sync_user_document(db, chat_id, user_id, sender_username, sender_first_name)
+    )
+    _background_tasks.add(_bg_doc)
+    _bg_doc.add_done_callback(_background_tasks.discard)
 
     if enable_background_extraction:
         task = asyncio.create_task(

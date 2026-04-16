@@ -5,7 +5,6 @@ import re
 import sys
 import time
 import uuid
-from dataclasses import dataclass
 from datetime import datetime, timezone
 
 log = logging.getLogger("alta")
@@ -104,500 +103,59 @@ from private_profile import (
 )
 from voice import ElevenLabsError, ElevenLabsTTS, detect_voice_request
 
-BOT_ALIASES = [
-    "\u0430\u043b\u044c\u0442\u0430",
-    "\u0430\u043b\u044c\u0442",
-    "\u0430\u043b\u044c\u0442\u0443\u0448\u043a\u0430",
-    "\u0430\u043b\u044c\u0442\u0443\u0448\u0435\u0447\u043a\u0430",
-    "\u0430\u043b\u044c\u0442\u0435\u043d\u044c\u043a\u0430",
-]
-
-class CooldownManager:
-    """Tracks per-key timestamps with automatic eviction of stale entries."""
-
-    def __init__(self, max_size: int = 5000, evict_after: float = 3600.0):
-        self._data: dict[tuple[int, int], float] = {}
-        self._max_size = max_size
-        self._evict_after = evict_after
-
-    def check(self, key: tuple[int, int], cooldown_sec: float) -> bool:
-        """Return True if cooldown has passed (action allowed). Records timestamp on success."""
-        now = time.time()
-        last = self._data.get(key, 0.0)
-        if now - last < cooldown_sec:
-            return False
-        self._data[key] = now
-        self._maybe_evict(now)
-        return True
-
-    def record(self, key: tuple[int, int]) -> None:
-        """Record a timestamp without cooldown check."""
-        now = time.time()
-        self._data[key] = now
-        self._maybe_evict(now)
-
-    def get_last(self, key: tuple[int, int]) -> float:
-        return self._data.get(key, 0.0)
-
-    def pop(self, key: tuple[int, int]) -> None:
-        self._data.pop(key, None)
-
-    def _maybe_evict(self, now: float) -> None:
-        if len(self._data) <= self._max_size:
-            return
-        cutoff = now - self._evict_after
-        stale = [k for k, ts in self._data.items() if ts < cutoff]
-        for k in stale:
-            del self._data[k]
-        # If still over limit after TTL eviction, drop oldest entries
-        if len(self._data) > self._max_size:
-            by_age = sorted(self._data.items(), key=lambda kv: kv[1])
-            to_drop = len(self._data) - self._max_size
-            for k, _ in by_age[:to_drop]:
-                del self._data[k]
-
-
-class LockRegistry:
-    """Manages per-key asyncio.Lock instances with bounded size."""
-
-    def __init__(self, max_size: int = 2000):
-        self._locks: dict[int, tuple[asyncio.Lock, float]] = {}
-        self._max_size = max_size
-
-    def get(self, key: int) -> asyncio.Lock:
-        entry = self._locks.get(key)
-        now = time.time()
-        if entry is not None:
-            lock, _ = entry
-            self._locks[key] = (lock, now)
-            return lock
-        lock = asyncio.Lock()
-        self._locks[key] = (lock, now)
-        self._maybe_evict()
-        return lock
-
-    def _maybe_evict(self) -> None:
-        if len(self._locks) <= self._max_size:
-            return
-        # Only evict unlocked locks, oldest first
-        candidates = [
-            (k, ts) for k, (lock, ts) in self._locks.items() if not lock.locked()
-        ]
-        candidates.sort(key=lambda kv: kv[1])
-        to_drop = len(self._locks) - self._max_size
-        for k, _ in candidates[:to_drop]:
-            del self._locks[k]
-
-
-_cooldown_calls = CooldownManager(max_size=5000, evict_after=3600.0)
-_cooldown_reaction = CooldownManager(max_size=5000, evict_after=3600.0)
-_cooldown_verification = CooldownManager(max_size=1000, evict_after=600.0)
-_cooldown_voice = CooldownManager(max_size=5000, evict_after=3600.0)
-_chat_locks = LockRegistry(max_size=2000)
-WORD_BOUNDARY_CLASS = "0-9A-Za-z\u0410-\u042f\u0430-\u044f\u0401\u0451_"
-MEDIA_REPLY_COOLDOWN_KEY = "media_reply"
-
-
-def _alias_part(ch: str) -> str:
-    if ch in {"\u0435", "\u0451"}:
-        return "[\u0435\u0451]+"
-    if ch.isalpha():
-        return f"{re.escape(ch)}+"
-    return re.escape(ch)
-
-
-def _compile_alias_patterns(aliases: list[str]) -> list[re.Pattern[str]]:
-    patterns: list[re.Pattern[str]] = []
-    for alias in aliases:
-        body = "".join(_alias_part(ch) for ch in alias.lower())
-        pattern = rf"(?<![{WORD_BOUNDARY_CLASS}]){body}(?![{WORD_BOUNDARY_CLASS}])"
-        patterns.append(re.compile(pattern, re.IGNORECASE))
-    return patterns
-
-
-ALIAS_PATTERNS = _compile_alias_patterns(BOT_ALIASES)
-BRACKET_USERNAME_RE = re.compile(r"\[(@?[A-Za-z][A-Za-z0-9_]{4,31})\]")
-CODE_RE = re.compile(r"\b(\d{4})\b")
-LEADING_USER_TAG_RE = re.compile(
-    r"^\s*\[\s*(?:(?:to\s+)?(?:current\s+speaker\s+)?)?(?:id=)?\d+(?:\s+@[A-Za-z0-9_]{4,32})?\s*\]\s*",
-    re.IGNORECASE,
+from cooldowns import (
+    cooldown_ok,
+    get_chat_turn_lock,
+    mark_media_cooldown,
+    mark_voice_reply_cooldown,
+    media_cooldown_ok,
+    reaction_ack_cooldown_ok,
+    verification_get_last,
+    verification_pop,
+    verification_record,
+    voice_reply_cooldown_ready,
+    MEDIA_REPLY_COOLDOWN_KEY,
 )
-LEADING_ROLE_TAG_RE = re.compile(r"^\s*(?:system|user|assistant)\s*:\s*", re.IGNORECASE)
-LEADING_MENTION_ADDRESS_RE = re.compile(r"^\s*(?P<mention>@[A-Za-z][A-Za-z0-9_]{4,31})(?P<sep>[\s,.:;!?-]+)")
-LEADING_ALTA_TAG_RE = re.compile(r"^\s*(?:альта|alta)\s*:\s*", re.IGNORECASE)
-SYSTEM_LINE_RE = re.compile(
-    r"^\s*(?:"
-    r"Текущий собеседник для этого ответа:|"
-    r"Профиль текущего собеседника:|"
-    r"Заметки о собеседнике:|"
-    r"Краткое резюме общего чата\.?|"
-    r"Краткое резюме чата\.?"
-    r")",
-    re.IGNORECASE,
+from moderation import (
+    JoinVerification,
+    UNBAN_COMMAND_RE,
+    _can_restrict_members,
+    _extract_code_candidate,
+    _join_verification_ban_kwargs,
+    _looks_like_spam,
+    _make_join_code,
+    _parse_unban_target_token,
+    _pending_join_verification,
+    is_emoji_only_message,
 )
-SYSTEM_META_LINE_RE = re.compile(
-    r"^\s*-\s*(?:"
-    r"user_id|username|telegram_first_name|"
-    r"Предпочтительное обращение|Ник в Telegram|Пол|Интересы|"
-    r"Как человек общается|Как ему лучше отвечать|Заметка о динамике общения"
-    r")\s*:",
-    re.IGNORECASE,
+from sanitization import (
+    ALIAS_PATTERNS,
+    BOT_ALIASES,
+    BRACKET_USERNAME_RE,
+    EMOJI_CHAR_RE,
+    INVALID_REQUESTED_NAMES,
+    LEADING_ALTA_TAG_RE,
+    LEADING_MENTION_ADDRESS_RE,
+    LEADING_ROLE_TAG_RE,
+    LEADING_USER_TAG_RE,
+    PROFILE_COMMAND_DETECT_RE,
+    SYSTEM_LINE_RE,
+    SYSTEM_META_LINE_RE,
+    WORD_BOUNDARY_CLASS,
+    convert_bracket_mentions_to_tg,
+    extract_requested_display_name,
+    format_user_label,
+    is_trigger,
+    normalize_text,
+    reaction_to_token,
+    sanitize_incoming_text,
+    sanitize_outgoing_text,
+    strip_foreign_leading_mention,
+    strip_mention,
 )
-EMOJI_CHAR_RE = re.compile(
-    "["
-    "\U0001F300-\U0001FAFF"
-    "\U00002600-\U000027BF"
-    "\U0001F1E6-\U0001F1FF"
-    "\u200d"
-    "\ufe0f"
-    "]+",
-    flags=re.UNICODE,
-)
-PROFILE_COMMAND_DETECT_RE = re.compile(r"^/(?:profile|user_profile)(?:@\S+)?(?:\s|$)", re.IGNORECASE)
-NAME_REQUEST_COMMAND_RE = re.compile(r"^/(?:setname|set_name|callme)\s+(?P<name>.+)$", re.IGNORECASE)
-NAME_REQUEST_PATTERNS = (
-    re.compile(r"^(?:зови|называй)\s+меня\s+(?P<name>.+)$", re.IGNORECASE),
-    re.compile(r"^(?:можешь\s+звать|можешь\s+называть)\s+меня\s+(?P<name>.+)$", re.IGNORECASE),
-    re.compile(
-        r"^(?:обращайся\s+ко\s+мне(?:\s+как)?|можешь\s+обращаться\s+ко\s+мне(?:\s+как)?)\s+(?P<name>.+)$",
-        re.IGNORECASE,
-    ),
-)
+
 NAME_APPROVE_RE = re.compile(r"^(?:/approve_name|/approve_nick|одобряю|approve)\b", re.IGNORECASE)
 NAME_REJECT_RE = re.compile(r"^(?:/deny_name|/deny_nick|не\s+одобряю|deny|reject)\b", re.IGNORECASE)
-UNBAN_COMMAND_RE = re.compile(
-    r"^/unban(?:@[A-Za-z][A-Za-z0-9_]{4,31})?(?:\s+(?P<target>\S+))?\s*$",
-    re.IGNORECASE,
-)
-INVALID_REQUESTED_NAMES = {
-    "ты",
-    "тебя",
-    "тебе",
-    "он",
-    "она",
-    "они",
-    "никто",
-    "не знаю",
-    "unknown",
-    "none",
-    "null",
-}
-
-
-@dataclass
-class JoinVerification:
-    code: str
-    deadline_ts: float
-    task: asyncio.Task
-    join_message_id: int
-
-
-_pending_join_verification: dict[tuple[int, int], JoinVerification] = {}
-
-
-def get_chat_turn_lock(chat_id: int) -> asyncio.Lock:
-    return _chat_locks.get(chat_id)
-
-
-def _join_verification_ban_kwargs(chat_id: int, user_id: int) -> dict[str, object]:
-    return {
-        "chat_id": chat_id,
-        "user_id": user_id,
-        "revoke_messages": True,
-    }
-
-
-def _chat_member_status(member) -> str:
-    raw = getattr(member, "status", "")
-    value = getattr(raw, "value", raw)
-    return str(value or "").lower()
-
-
-def _can_restrict_members(member) -> bool:
-    status = _chat_member_status(member)
-    if status in {"creator", "owner"}:
-        return True
-    return status == "administrator" and bool(getattr(member, "can_restrict_members", False))
-
-
-def _parse_unban_target_token(raw: str) -> tuple[int | None, str | None]:
-    token = str(raw or "").strip()
-    if not token:
-        return None, None
-    if token.startswith("@"):
-        token = token[1:]
-    if token.lstrip("-").isdigit():
-        try:
-            return int(token), None
-        except ValueError:
-            return None, None
-    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", token):
-        return None, token
-    return None, None
-
-
-def cooldown_ok(chat_id: int, user_id: int, cooldown_sec: int) -> bool:
-    if cooldown_sec <= 0:
-        return True
-    return _cooldown_calls.check((chat_id, user_id), cooldown_sec)
-
-
-def reaction_ack_cooldown_ok(chat_id: int, user_id: int, cooldown_sec: int = 180) -> bool:
-    return _cooldown_reaction.check((chat_id, user_id), cooldown_sec)
-
-
-def voice_reply_cooldown_ready(chat_id: int, user_id: int, cooldown_sec: int) -> bool:
-    if cooldown_sec <= 0:
-        return True
-    now = time.time()
-    last = _cooldown_voice.get_last((chat_id, user_id))
-    return (now - last) >= cooldown_sec
-
-
-def mark_voice_reply_cooldown(chat_id: int, user_id: int) -> None:
-    _cooldown_voice.record((chat_id, user_id))
-
-
-async def media_cooldown_ok(db: DB, chat_id: int, user_id: int, cooldown_sec: int) -> bool:
-    if cooldown_sec <= 0:
-        return True
-    last = await db.get_cooldown_last_ts(chat_id, user_id, MEDIA_REPLY_COOLDOWN_KEY)
-    return (time.time() - last) >= cooldown_sec
-
-
-async def mark_media_cooldown(db: DB, chat_id: int, user_id: int):
-    await db.touch_cooldown(chat_id, user_id, MEDIA_REPLY_COOLDOWN_KEY, time.time())
-
-
-def normalize_text(text: str) -> str:
-    t = text.lower().replace("\u0451", "\u0435")
-    t = re.sub(r"[^a-zа-я0-9\s@_]", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-
-def is_trigger(message: Message, bot_username: str, bot_id: int) -> bool:
-    raw_text = message.text or ""
-
-    if (
-        message.reply_to_message
-        and message.reply_to_message.from_user
-        and message.reply_to_message.from_user.id == bot_id
-    ):
-        return True
-
-    text = normalize_text(raw_text)
-
-    if bot_username and f"@{bot_username.lower()}" in text:
-        return True
-
-    for pattern in ALIAS_PATTERNS:
-        if pattern.search(text):
-            return True
-
-    return False
-
-
-def strip_mention(text: str, bot_username: str) -> str:
-    t = text or ""
-
-    # Strip only a leading direct call to the bot. Mentions inside the message
-    # can carry meaning and should stay untouched.
-    if bot_username:
-        t = re.sub(
-            rf"^\s*@{re.escape(bot_username)}\b[\s,.:;!?-]*",
-            "",
-            t,
-            flags=re.IGNORECASE,
-        )
-
-    trimmed = t.lstrip()
-    changed = True
-    while changed and trimmed:
-        changed = False
-        for pattern in ALIAS_PATTERNS:
-            match = pattern.match(trimmed)
-            if not match:
-                continue
-            trimmed = trimmed[match.end() :]
-            trimmed = re.sub(r"^[\s,.:;!?-]+", "", trimmed)
-            changed = True
-            break
-    t = trimmed
-
-    # Drop only leftover separators at the start after removing the bot mention,
-    # but keep the user's final punctuation intact.
-    t = re.sub(r"^[\s,.:;!-]+", "", t)
-    t = re.sub(r"\s+([,.:;!?])", r"\1", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-
-def convert_bracket_mentions_to_tg(text: str) -> str:
-    def repl(match: re.Match[str]) -> str:
-        username = match.group(1).lstrip("@")
-        return f"@{username}"
-
-    return BRACKET_USERNAME_RE.sub(repl, text or "")
-
-
-def sanitize_incoming_text(text: str) -> str:
-    lines = []
-    for raw_line in (text or "").splitlines():
-        line = raw_line.strip()
-        if not line:
-            if lines and lines[-1]:
-                lines.append("")
-            continue
-        if SYSTEM_LINE_RE.match(line) or SYSTEM_META_LINE_RE.match(line):
-            continue
-
-        previous = None
-        while line and line != previous:
-            previous = line
-            line = LEADING_USER_TAG_RE.sub("", line).strip()
-            line = LEADING_ROLE_TAG_RE.sub("", line).strip()
-            line = LEADING_ALTA_TAG_RE.sub("", line).strip()
-
-        if line:
-            lines.append(line)
-
-    cleaned = "\n".join(lines).strip()
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-    return cleaned
-
-
-def strip_foreign_leading_mention(text: str, sender_username: str | None) -> str:
-    cleaned = str(text or "").strip()
-    if not cleaned or not sender_username:
-        return cleaned
-
-    match = LEADING_MENTION_ADDRESS_RE.match(cleaned)
-    if not match:
-        return cleaned
-
-    allowed = f"@{sender_username.lstrip('@').lower()}"
-    if match.group("mention").lower() == allowed:
-        return cleaned
-    return cleaned[match.end() :].lstrip()
-
-
-def _normalize_space(text: str) -> str:
-    return " ".join(str(text or "").strip().split())
-
-
-def extract_requested_display_name(text: str) -> str | None:
-    raw = str(text or "").strip()
-    if not raw:
-        return None
-
-    match = NAME_REQUEST_COMMAND_RE.match(raw)
-    if match:
-        candidate = match.group("name")
-    else:
-        candidate = None
-        for pattern in NAME_REQUEST_PATTERNS:
-            match = pattern.match(raw)
-            if match:
-                candidate = match.group("name")
-                break
-        if candidate is None:
-            return None
-
-    cleaned = _normalize_space(candidate).strip(" .,!?:;\"'`«»")
-    lowered = cleaned.lower()
-    if not cleaned or len(cleaned) < 2 or len(cleaned) > 40:
-        return None
-    if cleaned.startswith("@"):
-        return None
-    if any(ch in cleaned for ch in "[]\n\r\t"):
-        return None
-    if lowered in INVALID_REQUESTED_NAMES:
-        return None
-    return cleaned
-
-
-def format_user_label(user_id: int, username: str | None, first_name: str | None = None) -> str:
-    if username:
-        return f"@{username}"
-    if first_name:
-        return first_name
-    return f"id={user_id}"
-
-
-def sanitize_outgoing_text(text: str) -> str:
-    lines = []
-    for raw_line in (text or "").splitlines():
-        line = raw_line.strip()
-        if not line:
-            if lines and lines[-1]:
-                lines.append("")
-            continue
-        if SYSTEM_LINE_RE.match(line) or SYSTEM_META_LINE_RE.match(line):
-            continue
-        if LEADING_ROLE_TAG_RE.match(line):
-            continue
-
-        line = LEADING_USER_TAG_RE.sub("", line)
-        line = LEADING_ALTA_TAG_RE.sub("", line)
-        # Strip timestamp prefix that model may copy from history: [HH:MM] or [H:MM]
-        line = re.sub(r"^\[\d{1,2}:\d{2}\]\s*", "", line)
-        # Replace em-dash / en-dash with regular hyphen
-        line = re.sub(r"\s*[—–]\s*", " - ", line)
-        lines.append(line.strip())
-
-    cleaned = "\n".join(lines).strip()
-    cleaned = LEADING_USER_TAG_RE.sub("", cleaned)
-    cleaned = LEADING_ALTA_TAG_RE.sub("", cleaned)
-    cleaned = EMOJI_CHAR_RE.sub("", cleaned)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-    return cleaned
-
-
-def reaction_to_token(r) -> str:
-    emoji = getattr(r, "emoji", None)
-    if emoji:
-        return str(emoji)
-    custom_emoji_id = getattr(r, "custom_emoji_id", None)
-    if custom_emoji_id:
-        return "кастомная реакция"
-    r_type = getattr(r, "type", None)
-    return str(r_type or "reaction")
-
-
-def _make_join_code() -> str:
-    return f"{random.randint(1000, 9999)}"
-
-
-def _extract_code_candidate(text: str) -> str | None:
-    t = (text or "").strip()
-    if not t:
-        return None
-    if t.isdigit() and len(t) == 4:
-        return t
-    m = CODE_RE.search(t)
-    return m.group(1) if m else None
-
-
-_SPAM_URL_RE = re.compile(
-    r"(?:https?://|t\.me/|tg://|bit\.ly/|goo\.gl/|@[A-Za-z][A-Za-z0-9_]{4,})",
-    re.IGNORECASE,
-)
-
-
-def _looks_like_spam(text: str) -> bool:
-    """Return True if text looks like spam (contains links, telegram handles, etc.)."""
-    return bool(_SPAM_URL_RE.search(text or ""))
-
-
-def is_emoji_only_message(text: str) -> bool:
-    t = (text or "").strip()
-    if not t:
-        return False
-    if any(ch.isalnum() for ch in t):
-        return False
-    non_ws = "".join(ch for ch in t if not ch.isspace())
-    return 1 <= len(non_ws) <= 8
 
 
 async def main():
@@ -699,7 +257,7 @@ async def main():
     ) -> bool:
         key = (chat_id, user_id)
         state = _pending_join_verification.pop(key, None)
-        _cooldown_verification.pop(key)
+        verification_pop(chat_id, user_id)
         if state and not state.task.done():
             state.task.cancel()
 
@@ -1234,7 +792,7 @@ async def main():
                 return
 
             _pending_join_verification.pop((chat_id, target_id), None)
-            _cooldown_verification.pop((chat_id, target_id))
+            verification_pop(chat_id, target_id)
             await message.reply(f"Пользователь {target_id} разбанен.")
             log.info("unban: actor=%s target=%s chat=%s", user_id, target_id, chat_id)
             return
@@ -1248,11 +806,15 @@ async def main():
             action = parsed.get("action")
             if action == "help":
                 from user_profile import PROFILE_HELP_TEXT
-                await message.reply(PROFILE_HELP_TEXT)
+                await message.reply(
+                    PROFILE_HELP_TEXT + "\n\nДля удобной настройки напиши мне в личку."
+                )
                 return
             if action == "show":
                 profile = await db.get_user_profile(chat_id, user_id)
-                await message.reply(format_profile_view(profile))
+                await message.reply(
+                    format_profile_view(profile) + "\n\nДля удобной настройки напиши мне в личку."
+                )
                 return
             if action == "clear":
                 cleared = cleared_profile()
@@ -1328,7 +890,7 @@ async def main():
             if candidate == pending.code:
                 pending.task.cancel()
                 _pending_join_verification.pop(key, None)
-                _cooldown_verification.pop(key)
+                verification_pop(chat_id, user_id)
                 try:
                     await bot.delete_message(chat_id=chat_id, message_id=pending.join_message_id)
                 except Exception:
@@ -1398,9 +960,9 @@ async def main():
                         pass
                 else:
                     now = time.time()
-                    last_hint = _cooldown_verification.get_last(key)
+                    last_hint = verification_get_last(chat_id, user_id)
                     if now - last_hint > 10:
-                        _cooldown_verification.record(key)
+                        verification_record(chat_id, user_id)
                         remaining = max(1, int(pending.deadline_ts - now))
                         await bot.send_message(
                             chat_id,
