@@ -40,3 +40,12 @@ Thumbs.db
 
 # Temp
 tmp*/
+
+# Agent worktrees
+.claude/worktrees/
+
+# Local-only: personal profile, infra notes, launch scripts with hosts
+creator_profile.json
+server_upgrade_notes.txt
+start.bat
+translator_bot_deploy/
