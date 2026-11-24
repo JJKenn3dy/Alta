@@ -11,6 +11,18 @@ from telemetry import CHARS_PER_TOKEN_HEURISTIC, LLMCallMetrics, approx_text_tok
 log = logging.getLogger("alta.llm")
 
 
+def _stop_tokens_for(model: str) -> list[str]:
+    """Стоп-токены — всегда включаем оба набора, модели могут смешивать шаблоны."""
+    return [
+        # ChatML (Qwen, Mistral и др.)
+        "<|im_end|>", "<|im_start|>", "<|endoftext|>",
+        # Gemma / Gemma 4
+        "<end_of_turn>", "<start_of_turn>",
+        # LLaMA-3
+        "<|eot_id|>",
+    ]
+
+
 class ContextOverflowError(RuntimeError):
     pass
 
@@ -184,6 +196,7 @@ class LLM:
                     temperature=temperature,
                     top_p=top_p,
                     stream=False,
+                    stop=_stop_tokens_for(self.model),
                 )
                 create_kwargs[token_limit_param] = max_tokens
                 if not penalty_params_disabled:

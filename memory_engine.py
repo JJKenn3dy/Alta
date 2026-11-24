@@ -29,8 +29,11 @@ HIGH_PRIORITY_KEYS = IDENTITY_KEYS | STYLE_KEYS
 
 MEMORY_STORE_MIN_IMPORTANCE = 0.3
 FACT_KEEP_PER_USER = 80
-FACT_CONTEXT_MIN_IMPORTANCE = 0.45
-MAX_FACT_LINES_IN_CONTEXT = 12
+# Порог показа факта в контексте = порогу записи. Раньше показ был 0.45, и факты
+# с importance 0.3–0.44 записывались в БД, но Альта их не видела ("записал, но не
+# помнит"). Порядок по importance DESC + лимит строк и так ставят важное вперёд.
+FACT_CONTEXT_MIN_IMPORTANCE = MEMORY_STORE_MIN_IMPORTANCE
+MAX_FACT_LINES_IN_CONTEXT = 16
 
 SUMMARY_INPUT_CHAR_LIMIT = 6_000
 MEMORY_EXTRACT_INPUT_CHAR_LIMIT = 1_800
@@ -332,6 +335,27 @@ def _join_list(value: Any, limit: int = 4) -> str:
     return ", ".join(items)
 
 
+def _merge_interests(current: Any, new_value: Any, max_items: int = 8) -> str:
+    """Накапливает интересы: старые + новые, дедуп без учёта регистра, порядок
+    сохраняется (старые первыми). Нужно потому, что LLM-извлечение возвращает
+    интересы ТОЛЬКО из текущего сообщения — без слияния новый интерес затирал бы
+    накопленные. Возвращает строку через запятую (как хранится в БД)."""
+    merged: list[str] = []
+    seen: set[str] = set()
+
+    def _add(raw: Any):
+        for part in (raw if isinstance(raw, list) else str(raw or "").split(",")):
+            s = str(part).strip()
+            key = s.lower()
+            if s and key not in seen:
+                seen.add(key)
+                merged.append(s)
+
+    _add(current)
+    _add(new_value)
+    return ", ".join(merged[:max_items])
+
+
 def _profile_text_or_list(value: Any, limit: int = 4) -> str:
     if isinstance(value, list):
         return _join_list(value, limit=limit)
@@ -600,20 +624,40 @@ def should_extract_user_facts(input_text: str) -> bool:
         return True
 
     first_person_markers = (
-        "я ", "я ", "мне ", "у меня", "мой ", "моя ", "мои ",
-        "для меня", "меня зовут", "мне ",
+        "я ", "мне ", "меня ", "у меня", "мой ", "моя ", "мои ", "моё ", "мою ",
+        "для меня", "со мной", "обо мне", "по мне",
     )
     fact_markers = (
+        # вкусы / занятия
         "люблю", "нравится", "предпочитаю", "увлекаюсь", "занимаюсь",
         "работаю", "учусь", "живу", "изучаю", "интересуюсь", "хочу",
-        "не люблю", "не нравится", "зовут", "родом из", "переехал",
-        "переехала", "лет", "года", "год", "из города", "из москвы",
-        "из питера", "играю в", "слушаю", "смотрю", "читаю", "пишу на",
-        "кодю на", "программирую", "ненавижу",
+        "не люблю", "не нравится", "зовут", "родом из", "ненавижу",
+        "играю в", "слушаю", "смотрю", "читаю", "пишу на", "кодю на",
+        "программирую", "увлекаюсь",
+        # возраст / место
+        "лет", "года", "год", "из города", "живу в", "переехал", "переехала",
+        "переезжаю", "родился", "родилась", "вырос", "выросла",
+        # жизненные события (оба рода — пользователь может быть мужчиной)
+        "сдал", "сдала", "купил", "купила", "продал", "продала",
+        "поступил", "поступила", "закончил", "закончила", "уволился",
+        "уволилась", "устроился", "устроилась", "женился", "вышла замуж",
+        "развёлся", "развелся", "завёл", "завела", "болею", "болел", "болела",
+        "получил", "получила", "выиграл", "выиграла", "потерял", "потеряла",
+        "начал", "начала", "бросил", "бросила", "встречаюсь", "расстался",
+        "рассталась",
+    )
+    # Временной якорь + любое утверждение часто = личный апдейт ("вчера сдал экзамен").
+    temporal_markers = (
+        "вчера", "сегодня", "завтра", "недавно", "на днях", "на выходных",
+        "в субботу", "в воскресенье", "только что", "позавчера",
     )
     has_first_person = any(marker in normalized for marker in first_person_markers)
     has_fact_marker = any(marker in normalized for marker in fact_markers)
-    return has_first_person or has_fact_marker
+    has_temporal = any(marker in normalized for marker in temporal_markers)
+    is_question = "?" in normalized
+    # Временной якорь засчитываем только для не-вопросов (вопрос «что сегодня делаем?»
+    # — не факт о пользователе).
+    return has_first_person or has_fact_marker or (has_temporal and not is_question)
 
 
 # ---------------------------------------------------------------------------
@@ -845,9 +889,18 @@ async def maybe_store_user_profile(
         confidence = current_profile.get("profile_confidence", 0.0)
     confidence = max(0.0, min(1.0, confidence))
 
-    interests = _join_list(profile.get("interests"))
-    communication_style = _clean_profile_text(profile.get("communication_style"), PROFILE_FIELD_CHAR_LIMIT)
-    response_preference = _clean_profile_text(profile.get("response_preference"), PROFILE_FIELD_CHAR_LIMIT)
+    # ВАЖНО: авто-извлечение НЕ должно обнулять накопленные поля. Если в этом
+    # сообщении интересов/стиля нет, LLM вернёт пусто — превращаем "" в None,
+    # чтобы upsert сохранил текущее значение, а не затёр его пустотой.
+    # (Ручная очистка профиля идёт через /profile и private_profile — другой путь.)
+    # Интересы НАКАПЛИВАЕМ (старые + новые), а не заменяем — LLM возвращает только
+    # интересы из текущего сообщения. Если новых нет, merged == current → None,
+    # чтобы upsert не трогал поле.
+    merged_interests = _merge_interests(current_profile.get("interests"), profile.get("interests"))
+    current_interests_norm = str(current_profile.get("interests") or "").strip()
+    interests = merged_interests if merged_interests and merged_interests != current_interests_norm else None
+    communication_style = _clean_profile_text(profile.get("communication_style"), PROFILE_FIELD_CHAR_LIMIT) or None
+    response_preference = _clean_profile_text(profile.get("response_preference"), PROFILE_FIELD_CHAR_LIMIT) or None
 
     await db.upsert_user_profile(
         chat_id, user_id,

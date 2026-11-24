@@ -15,27 +15,35 @@ Telegram (aiogram)
        |
    agent.py             — оркестратор: re-export из суб-модулей, run_agent() точка входа
        |
-   +-- context_builder.py   — сборка системного промпта, история, состояние Альты (mood)
+   +-- context_builder.py     — сборка системного промпта, история, mood state Альты
    +-- generation_pipeline.py — LLM генерация, web search, repeat rewrite, edit_answer
-   +-- memory_engine.py     — факты, профили, summary, background extraction
-   +-- postprocessing.py    — очистка ответа, repeat guard, gender fix, shrink
-   +-- llm.py               — обертка над OpenAI-compatible API (retry, overflow protection)
-   +-- db.py                — SQLite через aiosqlite (все таблицы и CRUD)
-   +-- prompts.py            — системный промпт персонажа
-   +-- voice.py             — TTS через ElevenLabs API
-   +-- media.py             — стикеры/кастомные эмодзи: каталог, LLM-выбор, отправка
-   +-- file_context.py      — RAG-lite: индексация knowledge-файлов, chunk scoring, retrieval
-   +-- lore_context.py      — helper для загрузки лора из файла (legacy, сейчас основной путь через file_context.py)
-   +-- profile_context.py   — загрузка JSON-профиля создателя
-   +-- user_profile.py      — команда /profile: парсинг, валидация, CRUD полей профиля
-   +-- private_profile.py   — личный кабинет в ЛС: inline-меню, валидация, импорт из групп
-   +-- router.py            — простой роутер: mention/reply detection + cooldown
-   +-- config.py            — загрузка конфига из .env
-   +-- telemetry.py         — JSONL-логирование метрик каждого turn'а
-   +-- runtime_io.py        — UTF-8 reconfigure для Windows stdout/stderr
+   +-- memory_engine.py       — факты, профили, summary, background extraction
+   +-- postprocessing.py      — очистка ответа, repeat guard, gender fix, shrink
+   +-- llm.py                 — обертка над OpenAI-compatible API (retry, overflow protection)
+   +-- db.py                  — SQLite через aiosqlite (все таблицы и CRUD)
+   +-- prompts.py             — системный промпт персонажа
+   +-- voice.py               — TTS через ElevenLabs API
+   +-- media.py               — стикеры/кастомные эмодзи: каталог, LLM-выбор, отправка
+   +-- file_context.py        — RAG-lite: индексация knowledge-файлов, chunk scoring, retrieval
+   +-- lore_context.py        — helper для загрузки лора из файла (legacy)
+   +-- profile_context.py     — загрузка JSON-профиля создателя
+   +-- user_profile.py        — команда /profile: парсинг, валидация, CRUD полей профиля
+   +-- private_profile.py     — личный кабинет в ЛС: inline-меню, валидация, импорт из групп
+   +-- cooldowns.py           — CooldownManager, LockRegistry, per-chat locks
+   +-- moderation.py          — JoinVerification, join/unban логика, spam detection
+   +-- sanitization.py        — sanitize_incoming/outgoing_text, prompt injection protection
+   +-- search.py              — веб-поиск (Yandex API + Brave fallback), result parsing, cache
+   +-- router.py              — legacy роутер: mention/reply detection
+   +-- config.py              — загрузка конфига из .env
+   +-- telemetry.py           — JSONL-логирование метрик каждого turn'а
+   +-- runtime_io.py          — UTF-8 reconfigure для Windows stdout/stderr
+
+launcher.py          — TUI control panel (Textual): запуск бота, туннель, llama-server, stats
+dashboard.py         — HTTP dashboard: статистика из orchestration.log и SQLite
+alta_console.py      — консольный интерфейс для прямого общения с Альтой без Telegram
 
 knowledge/           — текстовые файлы лора и контекста (автоиндексация)
-scripts/             — утилиты (init_db, build_media_catalog, analyze logs, debug dashboard, simulate_chat)
+scripts/             — утилиты: init_db, build_media_catalog, analyze_log, debug_dashboard, simulate_chat
 tests/               — unit-тесты (pytest)
 ```
 
@@ -47,10 +55,10 @@ tests/               — unit-тесты (pytest)
 1. Telegram message приходит в on_message (main.py)
 2. Проверки: allowed chat? not private? not bot? not pending verification?
 3. /profile команда? → обрабатывается без LLM, выход
-4. is_trigger() — бот реагирует на @mention, reply на свое сообщение, или имя "Альта"/"альт"/etc.
-5. cooldown_ok() — per-user rate limit
-6. sanitize_incoming_text() — удаление injection-попыток (системные теги, role-префиксы)
-7. detect_voice_request() — распознавание запроса на голосовой ответ
+4. is_trigger() — бот реагирует на @mention, reply на своё сообщение, или имя "Альта"/"альт"/etc.
+5. cooldown_ok() — per-user rate limit (cooldowns.py)
+6. sanitize_incoming_text() — удаление injection-попыток (sanitization.py)
+7. detect_voice_request() — распознавание запроса на голосовой ответ (voice.py)
 8. extract_requested_display_name() — распознавание "зови меня X"
 9. run_agent() вызывается (agent.py):
    a. maybe_store_identity_from_telegram() — синхронизация username/first_name в память
@@ -65,7 +73,7 @@ tests/               — unit-тесты (pytest)
         * speaker_summary + chat_summary (сжатая история)
         * user_facts/memory (факты о пользователе)
         * user_document (досье)
-        * reply_context (если ответ на чье-то сообщение)
+        * reply_context (если ответ на чьё-то сообщение)
         * file_context/RAG (релевантные куски из knowledge/)
         * lore (бэкграунд персонажа)
         * creator_profile (профиль создателя)
@@ -77,10 +85,10 @@ tests/               — unit-тесты (pytest)
         * сохраняет обратно в DB, добавляет краткоживущую реакцию если нужно
       - _compose_system_prompt() — финальная склейка
       - llm.chat() — вызов LLM
-      - 4 уровня fallback при context overflow: full -> compact -> minimal -> emergency
+      - 4 уровня fallback при context overflow: full → compact → minimal → emergency
    e. _deterministic_postprocess_answer() — постобработка:
       * удаление эмодзи, списков, self-reference ("я бот")
-      * fix_gender (мужской род -> женский для "я")
+      * fix_gender (мужской род → женский для "я")
       * shrink длинных ответов
    f. Repeat guard — если ответ повторяет недавние, перегенерация
    g. Intro generation — для новых пользователей
@@ -106,19 +114,12 @@ tests/               — unit-тесты (pytest)
 ### `main.py`
 Точка входа. Инициализация бота (aiogram), LLM, DB, TTS, media catalog. Содержит:
 
-- **`CooldownManager`** — per-key rate limiter с TTL-eviction
-- **`LockRegistry`** — per-chat asyncio.Lock для сериализации turn'ов
-- **`is_trigger()`** — определяет, нужно ли боту реагировать (mention, reply, alias)
-- **`strip_mention()`** — убирает @botname и алиасы из начала сообщения
-- **`sanitize_incoming_text()`** — защита от prompt injection: удаляет `[id=123 @user]` теги, `system:` / `assistant:` префиксы, мета-строки профилей
-- **`sanitize_outgoing_text()`** — очистка ответа бота: удаление тегов, эмодзи, role-префиксов
 - **`on_new_chat_members()`** — антибот верификация: mute + код из 4 цифр + timeout + автобан
-- **`on_message()`** — главный handler: маршрутизация, /profile, генерация, голос, медиа
+- **`on_message()`** — главный handler: маршрутизация, /profile, генерация, голос, медиа; включает `_keep_typing()` — фоновая задача обновляет typing-индикатор каждые 4 с пока агент работает
 - **`on_private_message()`** — handler для ЛС: профиль через inline-меню, без LLM
 - **`on_pm_callback()`** — обработка inline-кнопок личного кабинета
 - **`on_message_reaction()`** — реакция на реакции пользователей (с вероятностью)
-- **Join verification система** — полный flow: генерация кода, таймаут, бан ботов, `/unban`
-- **Name approval система** — запрос имени -> одобрение создателем -> `/approve_name` / `/deny_name`
+- **Name approval система** — запрос имени → одобрение создателем → `/approve_name` / `/deny_name`
 - **`/profile` команда** — делегируется в `user_profile.py`
 
 ### `agent.py`
@@ -127,7 +128,7 @@ tests/               — unit-тесты (pytest)
 ### `context_builder.py`
 Сборка контекста для LLM. Ключевые функции:
 
-- **`build_context()`** — главная функция: собирает все system_blocks, историю, обновляет mood state
+- **`build_context()`** — главная функция: собирает все system_blocks, историю, обновляет mood state; ответы Альты другим участникам группы помечаются `[->id=X]` — модель знает, кому был адресован каждый её ответ
 - **`_build_context_plans()`** — 4 плана (full/compact/minimal/emergency) с разными бюджетами
 - **`build_identity_block()`** — блок профиля собеседника
 - **`build_current_speaker_block()`** — блок текущего отправителя (speaker guard)
@@ -146,7 +147,17 @@ LLM-генерация ответа:
 - **`edit_answer()`** — постредактирование через LLM при нарушениях стиля
 - **`generate_simple_reply_fallback()`** — аварийная генерация без контекста
 - **`_rewrite_repeated_reply()`** — перегенерация при повторе ответа
-- **Web search**: `_answer_defers_web_lookup()`, `_pick_web_search_query()`, `_should_force_web_fallback()`
+- Web search делегируется в `search.py`; `_answer_defers_web_lookup()`, `_pick_web_search_query()`, `_should_force_web_fallback()` — маршрутизация поиска
+
+### `search.py`
+Веб-поиск, выделен из generation_pipeline в отдельный модуль:
+
+- **Yandex Search API** — основной бэкенд (YC API key)
+- **Brave Search** — fallback (primp HTTP client)
+- **Кэш результатов** — TTL 300 секунд, per-query
+- **Авто-детект языка запроса** — по доле кириллицы, переключает entre Yandex / Brave
+- **Result parsing** — извлечение сниппетов из XML (Yandex) и JSON (Brave)
+- Константы: `WEB_RESULT_MAX_SNIPPETS = 3`, `WEB_RESULT_CHAR_LIMIT = 1000`, `WEB_SEARCH_TIMEOUT = 8.0`
 
 ### `memory_engine.py`
 Факты, профили, summary:
@@ -162,7 +173,7 @@ LLM-генерация ответа:
 Постобработка ответа:
 
 - **`_deterministic_postprocess_answer()`** — главная функция: эмодзи, списки, self-reference, gender fix, длина
-- **`_fix_gender()`** — замена мужского рода на женский ("я понял" -> "я поняла")
+- **`_fix_gender()`** — замена мужского рода на женский: покрывает формы с "я" ("я понял" → "я поняла") и без — глаголы в начале ответа или после запятой
 - **`_is_repeated_recent_reply()`** / **`_repeat_guard_hard_fallback()`** — защита от повторов
 - **`_fit_text()`** / **`_clip_text()`** — обрезка текста с учётом предложений
 
@@ -174,6 +185,31 @@ OpenAI-compatible API клиент:
 - **`_ensure_context_budget()`** — pre-flight проверка размера контекста перед вызовом API
 - **`ContextOverflowError`** — кастомное исключение для переполнения контекста
 - **`estimate_chat_tokens()`** — эвристическая оценка токенов (chars / 3.2)
+
+### `cooldowns.py`
+Rate limiting и per-chat блокировки. Выделено из `main.py`:
+
+- **`CooldownManager`** — per-key rate limiter с TTL-eviction, max 5000 записей
+- **`LockRegistry`** — per-chat `asyncio.Lock` для сериализации turn'ов (один ответ за раз на чат)
+- Используется в `main.py` для `USER_COOLDOWN_SEC` и предотвращения параллельных turn'ов
+
+### `moderation.py`
+Логика модерации, выделено из `main.py`:
+
+- **`JoinVerification`** — dataclass состояния ожидающей верификации (user_id, chat_id, код, дедлайн)
+- **`_pending_join_verification`** — in-memory dict `{(chat_id, user_id): JoinVerification}`; сбрасывается при рестарте
+- **`generate_verification_code()`** — 4-значный числовой код
+- **`check_verification_code()`** — проверка кода из текста сообщения
+- **`is_spam_message()`** — детект ссылок/инвайтов в сообщениях новых участников
+- **`parse_unban_target()`** — парсинг `/unban <user_id|@username>`
+
+### `sanitization.py`
+Защита от prompt injection. Выделено из `main.py`:
+
+- **`sanitize_incoming_text()`** — удаление `[id=... @user]` тегов, `system:` / `assistant:` префиксов, мета-строк профилей перед подачей в LLM
+- **`sanitize_outgoing_text()`** — очистка ответа бота: удаление тегов, role-префиксов
+- **`is_trigger()`** — определяет, нужно ли боту реагировать (mention, reply, alias)
+- **`strip_mention()`** — убирает @botname и алиасы из начала сообщения
 
 ### `db.py`
 SQLite storage через aiosqlite. Таблицы:
@@ -188,9 +224,9 @@ SQLite storage через aiosqlite. Таблицы:
 | `user_profiles` | Профили пользователей (имя, пол, интересы, стиль, extra_fields JSON) |
 | `pending_name_approvals` | Запросы на смену имени (ожидание одобрения создателем) |
 | `user_documents` | Досье пользователей (JSON + текст) |
-| `user_facts` | Извлеченные факты о пользователях (type, value, confidence, importance) |
+| `user_facts` | Извлечённые факты о пользователях (type, value, confidence, importance) |
 | `memories` | Legacy key-value память (мигрируется в user_facts) |
-| `debug_traces` | Debug-трейсы turn'ов |
+| `debug_traces` | Debug-трейсы turn'ов (retention: 30 строк) |
 | `cooldown_state` | Персистентные cooldown'ы |
 | `context_files` + `context_chunks` | Индекс knowledge-файлов и их чанков |
 | `alta_chat_state` | Состояние Альты в чате (energy, irritation, playfulness, social_battery) |
@@ -198,11 +234,10 @@ SQLite storage через aiosqlite. Таблицы:
 | `alta_reactions` | Краткоживущие реакции с TTL (reaction_kind, reaction_strength, ttl_messages) |
 
 Ключевые методы:
-- `get_last_messages()` — история с опциональной фокусировкой на конкретном пользователе
+- `get_last_messages()` — история с опциональной фокусировкой на конкретном пользователе; возвращает `user_id` и `target_user_id`
 - `get_chat_participants()` — активные участники через bounded scan
-- `get_user_profile(chat_id, user_id)` — профиль из конкретного чата
 - `get_user_profile_merged(chat_id, user_id)` — слияние группового + приватного профиля; приватный (user-set) имеет приоритет
-- `get_all_group_profiles_merged(user_id)` — слияние профилей из всех групп для данного пользователя (используется при импорте)
+- `get_all_group_profiles_merged(user_id)` — слияние профилей из всех групп (для импорта)
 - `count_user_facts_global(user_id)` — количество фактов по всем групповым чатам
 - `upsert_user_fact()` — upsert с заменой confidence/importance на новые значения при конфликте
 - `prune_user_facts()` — обрезка до лимита по importance/confidence
@@ -235,27 +270,16 @@ RAG-lite система для knowledge-файлов:
 - **`sync_context_dir()`** — сканирует `knowledge/` каждые 15 сек, индексирует файлы в SQLite
 - **`chunk_text()`** — разбивка текста на чанки (900 chars, 120 overlap)
 - **`retrieve_context_snippets()`** — keyword-based retrieval с scoring:
-  - Exact query match: +4.0
-  - Path match: +5.0
-  - Token match: +1.25 (text) / +3.0 (path)
-  - Lore boost: +2.0 для файлов с префиксом `lore_`
+  - Exact query match: +4.0 / Path match: +5.0 / Token match: +1.25 (text) / +3.0 (path) / Lore boost: +2.0
 - **`build_file_context_block()`** — форматирование snippets для промпта (lore vs обычные файлы)
-
-### `lore_context.py`
-Legacy-helper для загрузки текстового лора с кэшированием по mtime. В текущем рантайм-пайплайне основной источник лора — `file_context.py` (RAG по `knowledge/lore_*`).
-
-### `profile_context.py`
-Загрузка JSON-профиля создателя (Захара) и форматирование в системный блок.
 
 ### `user_profile.py`
 Команда `/profile` — полный CRUD профиля пользователя в групповом чате:
 
 - Субкоманды: show, help, set, patch (bulk), delete, clear
 - Алиасы полей на русском и английском ("имя" → "approved_display_name")
-- Валидация и нормализация значений (unicodedata NFKC, max length, strip whitespace)
 - Extra fields в JSON-колонке `extra_fields` (about, age, city, location, occupation)
 - `apply_profile_updates()` — bulk update из списка изменений
-- `delete_profile_field()` — удаление конкретного поля
 - `format_profile_view()` — форматирование профиля для вывода пользователю
 
 ### `private_profile.py`
@@ -264,22 +288,37 @@ Legacy-helper для загрузки текстового лора с кэши�
 - **Inline-меню** (aiogram InlineKeyboardMarkup): главное меню, меню редактирования, выбор пола
 - **In-memory state** `_pm_state: dict[int, dict]` — отслеживает, какое поле редактирует пользователь
 - **Rate limiter** — макс. 30 сохранений/час на пользователя
-- **`validate_field(field, value)`** — валидация с правилами на каждое поле:
-  - блокирует ссылки, HTML-теги, управляющие символы, Telegram-команды
-  - применяет лимиты длины по полю
-- **`save_field(db, user_id, field, value)`** — сохранение в приватный профиль `(user_id, user_id)`
-- **`clear_all_fields(db, user_id)`** — полная очистка приватного профиля
-- **`format_import_preview(group_profile, private_profile, facts_count)`** — превью данных из групп:
-  - ✓ = уже в приватном профиле
-  - → = будет добавлено при импорте
-- **`import_from_groups(db, user_id)`** — копирует поля из групповых профилей в приватный, не перезаписывая уже заданные вручную значения
-- `relationship_notes` исключён из импорта — авто-значения этого поля склонны быть транзиентными
+- **`validate_field(field, value)`** — блокирует ссылки, HTML-теги, управляющие символы, Telegram-команды; лимиты длины по полю
+- **`import_from_groups(db, user_id)`** — копирует поля из групповых профилей в приватный, не перезаписывая вручную заданные
+- **`format_import_preview()`** — превью данных из групп: ✓ = уже в личном профиле, → = будет добавлено
 
-### `router.py`
-Простой роутер (legacy, частично заменен логикой в main.py):
-- Mention detection
-- Reply-to-bot detection
-- Per-user cooldown
+### `launcher.py`
+TUI control panel на Textual. Запускается напрямую (`python launcher.py`):
+
+- **`AltaPanel`** — Textual App с sidebar, логом и панелью управления
+- **Статусы сервисов** — llama-server (HTTP health-check), SSH туннель (socket probe), Alta бот (PowerShell process query)
+- **Статистика серверов** — SSH-запрос CPU/RAM/GPU/VRAM/Temp с LAN-сервера и VPS каждые 15 сек
+- **Model selector** — читает список `.gguf` файлов с сервера через SSH, обновляет `LLM_MODEL` в `.env`
+- **"Запустить всё"** — выбор модели → обновление `.env` → SSH туннель → `start_alta.sh` на сервере → ожидание llama-server (до 90 сек) → запуск `main.py`
+- **Log streaming** — stdout/stderr бота в реальном времени с цветовой разметкой
+- **Прямое SSH** — открывает Windows Terminal / cmd с SSH-сессией на сервер или VPS
+- Горячие клавиши: `r` рестарт, `s` запустить всё, `q` выход
+
+### `dashboard.py`
+HTTP-дашборд. Запускается отдельно, слушает `127.0.0.1:8765`:
+
+- Читает `orchestration.log` (JSONL) и SQLite напрямую — нет зависимости от запущенного бота
+- Статистика turn'ов: LLM latency, token usage, memory updates
+- Топ пользователей по активности
+- Последние сообщения и debug-трейсы
+- Доступен в браузере без авторизации (localhost only)
+
+### `alta_console.py`
+Консольный интерфейс для прямого общения с Альтой без Telegram и без запуска бота:
+
+- Подключается к той же БД и тому же LLM-серверу что и основной бот
+- Полезен для разработки и отладки промптов
+- Поддерживает весь тот же pipeline (context_builder, generation_pipeline, mood, memory)
 
 ### `config.py`
 Загрузка конфигурации из `.env`:
@@ -305,6 +344,8 @@ Legacy-helper для загрузки текстового лора с кэши�
 | `VOICE_REPLY_PROB` | Вероятность голосового ответа | 0 |
 | `MEDIA_REPLY_PROB` | Вероятность стикера после ответа | 0.22 |
 | `KNOWLEDGE_DIR` | Директория с knowledge-файлами | `./knowledge` |
+| `YANDEX_SEARCH_API_KEY` | API key для Yandex Search | — |
+| `YANDEX_FOLDER_ID` | Folder ID для Yandex Search | — |
 
 ### `telemetry.py`
 JSONL-логирование в `orchestration.log`:
@@ -312,9 +353,6 @@ JSONL-логирование в `orchestration.log`:
 - **`TurnMetrics`** — dataclass со всеми метриками turn'а (LLM calls, токены, латентность, обновления памяти)
 - **`JSONLLogger`** — thread-safe append-only JSONL writer
 - События: `turn_start`, `context_snapshot`, `llm_call`, `turn_end`
-
-### `runtime_io.py`
-Reconfigure stdout/stderr в UTF-8 для Windows.
 
 ---
 
@@ -336,21 +374,20 @@ Reconfigure stdout/stderr в UTF-8 для Windows.
 
 ## Система памяти и профилей
 
-Бот запоминает информацию о каждом пользователе на нескольких уровнях:
-
 ### 1. User Facts (`user_facts`)
 Структурированные факты с типами: `interest`, `preference`, `work`, `study`, `location`, `goal`, `bio`, `fact`
 - Каждый факт имеет `confidence` (0–1) и `importance` (0–1)
 - Извлекаются автоматически через LLM из сообщений (в фоне после ответа)
-- Pruning: хранится до 80 фактов на пользователя
-- **Защита от загрязнения**: `_build_extraction_text()` явно размечает сообщения других участников как "Другой участник чата", LLM не приписывает чужие факты целевому пользователю
+- Pruning: хранится до 80 фактов на пользователя (`FACT_KEEP_PER_USER`)
+- **Защита от загрязнения**: `_build_extraction_text()` явно размечает сообщения других участников, LLM не приписывает чужие факты целевому пользователю
+- **Постфильтр**: `_FACT_VALUE_STOP_PATTERNS` отсекает мусорные факты (roleplay, транзиентные состояния)
 
 ### 2. User Profiles (`user_profiles`)
 Агрегированный профиль: имя, ник, пол, интересы, стиль общения, предпочтения, extra_fields JSON
 - Групповой профиль `(chat_id, user_id)` — обновляется автоматически через LLM
 - Приватный профиль `(user_id, user_id)` — задаётся вручную через ЛС бота
 - `get_user_profile_merged()` — итоговый профиль: приватный (user-set) **всегда побеждает** групповой (auto-extracted)
-- `relationship_notes` **не обновляется автоматически** — только вручную, во избежание записи транзиентных состояний
+- `relationship_notes` **не обновляется автоматически** — только вручную
 
 ### 3. User Documents (`user_documents`)
 Досье пользователя — автоматически пересобирается из фактов + профиля, инжектится в промпт при релевантных запросах.
@@ -360,13 +397,11 @@ Reconfigure stdout/stderr в UTF-8 для Windows.
 - `user_chat_summaries` — per-user резюме (не шарится между пользователями)
 
 ### Личный кабинет (ЛС бота)
-Пользователь может в любой момент написать боту в личку и управлять своим профилем:
+Пользователь пишет боту в личку → inline-меню без LLM:
 - Просмотр текущего профиля
 - Редактирование любого поля через inline-меню
-- Кнопка **"📥 Что обо мне знает Альта"** — показывает данные собранные из групп:
-  - ✓ = уже есть в личном профиле
-  - → = можно импортировать
-- Импорт не перезаписывает уже заданные вручную значения
+- Кнопка **"📥 Что обо мне знает Альта"** — показывает данные собранные из групп: ✓ = уже есть, → = можно импортировать
+- Импорт не перезаписывает вручную заданные значения
 
 ---
 
@@ -402,52 +437,34 @@ Reconfigure stdout/stderr в UTF-8 для Windows.
 | Благодарность | "спасибо", "thanks" | ↑ warmth, ↑ trust, реакция `amused` |
 | Творческий | вопросы, "объясни", "придумай" | ↑ playfulness, реакция `curious` |
 
-### Обновление на каждом ходу (build_context)
-1. Чтение состояния из DB
-2. Временное затухание: irritation/annoyance экспоненциально падают, energy/social_battery восстанавливаются
-3. Вычисление новых значений по сигналам входящего сообщения
-4. Сохранение в DB
-5. Добавление краткоживущей реакции (если нужно)
-6. Декремент TTL существующих реакций (tick)
-7. Форматирование в блок `[Твоё состояние — влияй на тон, не упоминай вслух]`
+### Drain (energy / social_battery)
+- energy: −0.003/msg (при агрессии дополнительно −0.03); восстановление +0.08/час
+- social_battery: −0.005/msg (при агрессии −0.06); восстановление +0.12/час
 
-Блок добавляется только если состояние отклоняется от нейтрального. Числа никогда не попадают в промпт — только человекочитаемые метки.
+### Обновление на каждом ходу
+1. Чтение состояния из DB
+2. Временное затухание (irritation/annoyance экспоненциально, energy/battery time-based)
+3. Вычисление новых значений по сигналам входящего сообщения
+4. Сохранение в DB (background task, не блокирует ответ)
+5. Добавление краткоживущей реакции (если нужно) + декремент TTL
+6. Форматирование в блок `[Твоё состояние — влияй на тон, не упоминай вслух]`
+
+Блок добавляется только если состояние отклоняется от нейтрального. Числа никогда не попадают в промпт.
 
 ---
 
 ## Anti-spam / Верификация
 
-При входе нового пользователя в чат:
+При входе нового пользователя:
 1. Бот удаляет сервисное сообщение о входе
-2. Mute пользователя (только текст разрешен)
+2. Mute пользователя
 3. Генерирует 4-значный код
 4. Пользователь должен отправить код за N секунд
-5. Если не прошел — бан. Если отправил медиа/ссылки — мгновенный бан
+5. Если не прошёл — бан. Если отправил медиа/ссылки — мгновенный бан
 6. Бот-аккаунты банятся сразу
 7. `/unban <user_id|@username>` — разбан (только админы)
 
----
-
-## Голосовые ответы
-
-- Распознавание запросов на русском: "запиши голосом", "скажи войсом", "озвучь"
-- Direct mode: "озвучь: конкретный текст" — озвучивает указанный текст
-- Reply mode: "ответь голосом" — генерирует ответ и озвучивает
-- Random voice: с вероятностью `VOICE_REPLY_PROB` бот отвечает голосом
-- TTS: ElevenLabs API (настраивается через env vars)
-
----
-
-## Стек технологий
-
-- **Python 3.11+**
-- **aiogram 3.4** — Telegram Bot API
-- **aiosqlite** — async SQLite
-- **openai** — OpenAI-compatible API client (для локальной LLM)
-- **python-dotenv** — загрузка .env
-- **requests + primp** — web search backends (Yandex API / Brave fallback)
-- **ElevenLabs API** — TTS (опционально)
-- **LLM**: любая OpenAI-compatible модель (по умолчанию Mistral Small через llama.cpp)
+`_pending_join_verification` хранится только в памяти — сбрасывается при рестарте.
 
 ---
 
@@ -457,15 +474,27 @@ Reconfigure stdout/stderr в UTF-8 для Windows.
 # 1. Установить зависимости
 pip install -r requirements.txt
 
-# 2. Создать .env (см. config.py для всех переменных)
+# 2. Создать .env
 cp .env.example .env
 # Заполнить BOT_TOKEN, ALLOWED_CHAT_IDS, etc.
 
 # 3. Запустить LLM сервер (llama.cpp или совместимый)
-# llama-server -m model.gguf --port 8080
+llama-server -m model.gguf --port 8080
 
 # 4. Запустить бота
 python main.py
+```
+
+**Control panel (рекомендуется):**
+```bash
+python launcher.py
+```
+Открывает TUI с управлением llama-server, SSH-туннелем и ботом в одном интерфейсе.
+
+**Dashboard (опционально):**
+```bash
+python dashboard.py
+# → http://127.0.0.1:8765
 ```
 
 ---
@@ -498,3 +527,18 @@ pytest tests/
 - `test_search_routing.py` — маршрутизация веб-поиска
 - `test_stress.py` — нагрузочные/оценочные сценарии
 - `test_user_profile_commands.py` — команда `/profile`
+
+---
+
+## Стек технологий
+
+- **Python 3.11+**
+- **aiogram 3.4** — Telegram Bot API
+- **aiosqlite** — async SQLite
+- **openai** — OpenAI-compatible API client (для локальной LLM)
+- **python-dotenv** — загрузка .env
+- **textual** — TUI для launcher.py
+- **httpx** — async HTTP (launcher.py)
+- **requests + primp** — web search backends (Yandex API / Brave fallback)
+- **ElevenLabs API** — TTS (опционально)
+- **LLM**: любая OpenAI-compatible модель (по умолчанию Mistral Small через llama.cpp)

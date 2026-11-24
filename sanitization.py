@@ -48,7 +48,10 @@ ALIAS_PATTERNS = _compile_alias_patterns(BOT_ALIASES)
 # Compiled regexes
 # ---------------------------------------------------------------------------
 
-BRACKET_USERNAME_RE = re.compile(r"\[(@?[A-Za-z][A-Za-z0-9_]{4,31})\]")
+# Только скобки с ЯВНОЙ @ конвертируем в пинг ([@username] -> @username).
+# Раньше @ была опциональной, и обычный текст [hello]/[update] в ответе
+# превращался в пинг случайного/несуществующего юзера.
+BRACKET_USERNAME_RE = re.compile(r"\[(@[A-Za-z][A-Za-z0-9_]{4,31})\]")
 LEADING_USER_TAG_RE = re.compile(
     r"^\s*\[\s*(?:(?:to\s+)?(?:current\s+speaker\s+)?)?(?:id=)?\d+(?:\s+@[A-Za-z0-9_]{4,32})?\s*\]\s*",
     re.IGNORECASE,
@@ -286,6 +289,8 @@ def sanitize_outgoing_text(text: str) -> str:
         line = LEADING_ALTA_TAG_RE.sub("", line)
         # Strip timestamp prefix that model may copy from history: [HH:MM] or [H:MM]
         line = re.sub(r"^\[\d{1,2}:\d{2}\]\s*", "", line)
+        # Strip attribution prefix from group chat history: [->id=123]
+        line = re.sub(r"^\[->id=\d+\]\s*", "", line)
         # Replace em-dash / en-dash with regular hyphen
         line = re.sub(r"\s*[—–]\s*", " - ", line)
         lines.append(line.strip())

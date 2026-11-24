@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -192,23 +193,42 @@ class DB:
     def __init__(self, path: str):
         self.path = path
         self.conn: Optional[aiosqlite.Connection] = None
+        # Сериализует явные транзакции между собой. Соединение общее на весь
+        # процесс, и fire-and-forget фоновые задачи пишут конкурентно.
+        self._write_lock = asyncio.Lock()
 
     @asynccontextmanager
     async def _transaction(self):
-        """Explicit transaction: BEGIN … COMMIT, with ROLLBACK on error."""
+        """Explicit transaction: BEGIN … COMMIT, with ROLLBACK on error.
+
+        Соединение в autocommit-режиме (isolation_level=None), поэтому неявных
+        транзакций нет и BEGIN всегда валиден. Лок не даёт двум явным транзакциям
+        пересечься на общем соединении.
+        """
         assert self.conn
-        await self.conn.execute("BEGIN")
-        try:
-            yield
-            await self.conn.commit()
-        except BaseException:
-            await self.conn.rollback()
-            raise
+        async with self._write_lock:
+            await self.conn.execute("BEGIN")
+            try:
+                yield
+                await self.conn.commit()
+            except BaseException:
+                await self.conn.rollback()
+                raise
 
     async def connect(self):
-        self.conn = await aiosqlite.connect(self.path)
+        # isolation_level=None → autocommit: каждый statement коммитится сразу,
+        # без неявной транзакции. Это устраняет класс ошибок "cannot start a
+        # transaction within a transaction" и преждевременный commit() чужой
+        # неявной транзакции, когда фоновые задачи пишут на общем соединении.
+        self.conn = await aiosqlite.connect(self.path, isolation_level=None)
         self.conn.row_factory = aiosqlite.Row
         await self.conn.execute("PRAGMA foreign_keys = ON")
+        await self.conn.execute("PRAGMA synchronous = NORMAL")  # safe with WAL, faster writes
+        # Дашборды (dashboard.py, dev_trace_dashboard.py, alta_console.py) читают тот
+        # же файл → несколько подключений. Ждём до 5с при коллизии с checkpoint,
+        # чтобы не падать с "database is locked".
+        await self.conn.execute("PRAGMA busy_timeout = 5000")
+        await self.conn.execute("PRAGMA cache_size = -8000")    # 8 MB page cache
         await self.conn.executescript(SCHEMA)
         await self._migrate_schema()
         await self._cleanup_identity_noise()
@@ -573,7 +593,7 @@ class DB:
                 # Don't add timestamps to assistant messages - the model
                 # copies the format and puts [HH:MM] in its own replies
                 content = r["text"]
-            out.append({"id": int(r["id"]), "role": r["role"], "content": content, "ts": ts_raw})
+            out.append({"id": int(r["id"]), "role": r["role"], "content": content, "ts": ts_raw, "user_id": r["user_id"], "target_user_id": r["target_user_id"]})
         return out
 
     async def get_summary(self, chat_id: int, user_id: int | None = None) -> str:

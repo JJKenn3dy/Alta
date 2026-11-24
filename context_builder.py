@@ -128,7 +128,7 @@ def _build_context_plans(max_tokens: int, history_limit: int) -> list[ContextPla
             history_messages=min(history_limit, CONTEXT_HISTORY_LIMIT),
             history_chars=DEFAULT_CONTEXT_CHAR_BUDGET,
             summary_chars=SUMMARY_CONTEXT_CHAR_LIMIT,
-            memory_lines=12,
+            memory_lines=16,
             file_chunks=DEFAULT_FILE_CONTEXT_CHUNKS,
             file_chars=DEFAULT_FILE_CONTEXT_CHARS,
             max_tokens=safe_max_tokens,
@@ -218,10 +218,13 @@ def _insert_time_gaps(messages: list[dict]) -> list[dict]:
 
 
 def _shrink_message(message: dict, limit: int = HISTORY_MESSAGE_CHAR_LIMIT) -> dict:
-    return {
+    result: dict = {
         "role": message["role"],
         "content": _fit_text(message.get("content", ""), limit),
     }
+    if "target_user_id" in message:
+        result["target_user_id"] = message["target_user_id"]
+    return result
 
 
 def _take_history_with_budget(history: list[dict], max_messages: int, max_chars: int) -> list[dict]:
@@ -667,6 +670,7 @@ def build_current_speaker_block(
     user_id: int,
     sender_username: str | None,
     sender_first_name: str | None,
+    creator_user_id: int | None = None,
 ) -> str:
     lines = [
         "Текущий собеседник для этого ответа:",
@@ -676,10 +680,26 @@ def build_current_speaker_block(
         lines.append(f"- username: @{sender_username.lstrip('@')}")
     if sender_first_name:
         lines.append(f"- имя в Telegram: {sender_first_name.strip()}")
+
+    is_creator = creator_user_id is not None and user_id == creator_user_id
+    if is_creator:
+        lines.append(
+            "- Это твой создатель Захар (свой, близкий). Характер НЕ теряй: не "
+            "подлизывайся, не сюсюкай, держи дерзость. НЕ лепи обращение/кличку в "
+            "каждую реплику — общайся по-простому. «Теплее» не значит пресно."
+        )
+    else:
+        lines.append(
+            "- Это НЕ твой создатель. Обращения «Шеф», «Захар» и любые ники/клички "
+            "из истории к нему НЕ относятся — не вешай их на этого человека."
+        )
     lines.extend(
         [
             "- Отвечай именно этому человеку.",
             "- Никогда не переноси имя, ник, пол, интересы и факты другого участника на текущего собеседника.",
+            "- Если спрашивает «кто я / помнишь меня / как меня зовут» — отвечай ТОЛЬКО по "
+            "данным этого блока и его профилю. Нет данных — честно скажи что не знаешь "
+            "(«хз, ты кто вообще»), не выдумывай и не приписывай чужой ник.",
             "- Имя используй только если без него непонятно к кому обращаешься. Не начинай с него каждую реплику.",
         ]
     )
@@ -844,7 +864,15 @@ async def build_context(
         focus_user_id=None,
     )
     history = _merge_histories(focused_history, shared_history, plan.history_messages, plan.history_chars)
-    prompt_history = [{"role": item["role"], "content": item["content"]} for item in history]
+    prompt_history = []
+    for item in history:
+        role = item["role"]
+        content = item["content"]
+        if role == "assistant":
+            target = item.get("target_user_id")
+            if target is not None and int(target) != user_id:
+                content = f"[->id={target}] {content}"
+        prompt_history.append({"role": role, "content": content})
     focused_prompt_history = [{"role": item["role"], "content": item["content"]} for item in focused_history]
 
     implicit_reply_block = ""
@@ -880,7 +908,7 @@ async def build_context(
     # 2. Кто пишет сейчас + speaker_guard
     system_blocks.append({
         "content": (
-            build_current_speaker_block(user_id, sender_username, sender_first_name)
+            build_current_speaker_block(user_id, sender_username, sender_first_name, creator_user_id)
             + "\nВ истории реплики помечены [id=123 @username]. Строго различай авторов."
         ),
         "bucket": "system",

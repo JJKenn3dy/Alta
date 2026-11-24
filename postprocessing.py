@@ -13,6 +13,10 @@ REPEAT_GUARD_MAX_CHARS = 400
 REPEAT_GUARD_MIN_KEY_CHARS = 3
 REPEAT_GUARD_SHORT_EXACT_MIN_KEY_CHARS = 2
 REPEAT_GUARD_SUBSTRING_MAX_CHARS = 28
+# Substring-сравнение применяем только к существенным фразам. Короткие реплики
+# ("ага", "норм", "ладно") сравниваем лишь по ТОЧНОМУ совпадению — иначе короткая
+# живая реплика, случайно входящая в недавний длинный ответ, ложно ловится как повтор.
+REPEAT_GUARD_SUBSTRING_MIN_CHARS = 12
 
 MIN_EDITOR_DRAFT_CHARS = 15
 MAX_EDITOR_REPLY_CHARS = 700
@@ -75,6 +79,35 @@ _GENDER_FIX_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"(?:^|(?<=[.!?]\s))Думал\b"), "Думала"),
     (re.compile(r"(?:^|(?<=[.!?]\s))Забыл\b"), "Забыла"),
     (re.compile(r"(?:^|(?<=[.!?]\s))Узнал\b"), "Узнала"),
+    # Bare verb forms without "я" — after comma/space or at sentence/message start
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))забил\b"), "забила"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))забыл\b"), "забыла"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))сказал\b"), "сказала"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))написал\b"), "написала"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))понял\b"), "поняла"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))пришёл\b"), "пришла"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))пошёл\b"), "пошла"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))был\b"), "была"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))знал\b"), "знала"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))думал\b"), "думала"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))решил\b"), "решила"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))хотел\b"), "хотела"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))видел\b"), "видела"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))слышал\b"), "слышала"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))успел\b"), "успела"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))нашёл\b"), "нашла"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))узнал\b"), "узнала"),
+    # Capitalized forms at sentence start (e.g. "Забил." → "Забила.")
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))Забил\b"), "Забила"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))Забыл\b"), "Забыла"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))Сказал\b"), "Сказала"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))Понял\b"), "Поняла"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))Пришёл\b"), "Пришла"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))Пошёл\b"), "Пошла"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))Был\b"), "Была"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))Знал\b"), "Знала"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))Хотел\b"), "Хотела"),
+    (re.compile(r"(?:^|(?<=[.!?]\s)|(?<=,\s))Нашёл\b"), "Нашла"),
 ]
 
 _SEARCH_RE = re.compile(r"\[SEARCH:\s*(.+?)\]", re.IGNORECASE)
@@ -254,15 +287,27 @@ def _remove_forbidden_self_reference(text: str) -> str:
     return value if value else text
 
 
+_CHAT_TEMPLATE_TOKEN_RE = re.compile(
+    r"(?:"
+    r"<\|(?:im_end|im_start|endoftext|fim_pad|repo_name|file_sep)[^>]*\|>"  # ChatML / Qwen
+    r"|<end_of_turn>"   # Gemma
+    r"|<start_of_turn>" # Gemma
+    r"|<\|eot_id\|>"    # Llama 3
+    r").*",
+    re.DOTALL,
+)
+
+
 def _deterministic_postprocess_answer(draft_answer: str) -> str:
     raw = str(draft_answer or "").strip()
     if not raw:
         return ""
+    # Обрезаем всё начиная с первого chat-template токена
+    raw = _CHAT_TEMPLATE_TOKEN_RE.sub("", raw).strip()
     value = _strip_list_prefixes(raw) if "\n" in raw or LIST_PREFIX_PATTERN.search(raw) else raw
     value = _SEARCH_RE.sub("", value).strip()
     value = re.sub(r"^\[\d{1,2}:\d{2}\]\s*", "", value)
     value = _limit_emoji(value, max_count=2)
-    value = re.sub(r"\s*[—–]\s*", " - ", value)
     value = re.sub(r"[ \t]+", " ", value)
     value = re.sub(r"\s*([,.:;!?])\s*", r"\1 ", value)
     value = re.sub(r"\s+", " ", value).strip()
@@ -279,9 +324,8 @@ def _deterministic_postprocess_answer(draft_answer: str) -> str:
 
     value = _fix_gender(value)
     value = _shrink_reply_text(value, limit=MAX_EDITOR_REPLY_CHARS, max_sentences=MAX_EDITOR_SENTENCES)
-    # Strip trailing punctuation that signals AI-generated text (.  ,  ;  :)
-    # Preserve: ellipsis (...), !, ?
-    value = re.sub(r"(?<!\.)\.(?!\.)(\s*)$", r"\1", value).rstrip()
+    # Trailing comma/semicolon/colon обычно означают оборванную фразу — их убираем.
+    # Точку в конце НЕ трогаем: это нормальная пунктуация, а не "признак ИИ".
     value = re.sub(r"[,;:]\s*$", "", value).rstrip()
     return value
 
@@ -306,7 +350,7 @@ def _looks_like_same_reply_key(left: str, right: str) -> bool:
         return True
     shorter = left if len(left) <= len(right) else right
     longer = right if len(left) <= len(right) else left
-    if len(shorter) < REPEAT_GUARD_MIN_KEY_CHARS:
+    if len(shorter) < REPEAT_GUARD_SUBSTRING_MIN_CHARS:
         return False
     if len(shorter) > REPEAT_GUARD_SUBSTRING_MAX_CHARS:
         return False
@@ -357,10 +401,54 @@ def _is_repeated_recent_reply(answer: str, recent_assistant_replies: list[str]) 
     return repeats >= 2
 
 
+# ---------------------------------------------------------------------------
+# Burst split — раздробить ответ на 2-3 коротких сообщения как у живого человека
+# ---------------------------------------------------------------------------
+BURST_MIN_TOTAL_CHARS = 60   # короче — одно сообщение
+BURST_MAX_PARTS = 3
+BURST_MIN_PART_CHARS = 4
+
+
+def split_into_bursts(text: str) -> list[str]:
+    """Разбивает готовый ответ на 1-3 сообщения по границам предложений.
+
+    Консервативно: дробит только если текст достаточно длинный И есть ≥2
+    предложения. Короткое/неделимое возвращает одним элементом. Микро-фрагменты
+    склеивает с соседом, число кусков ограничено BURST_MAX_PARTS.
+    """
+    t = _normalize_reply_text(text)
+    if not t:
+        return []
+    if len(t) < BURST_MIN_TOTAL_CHARS:
+        return [t]
+
+    parts = [p.strip() for p in re.split(r"(?<=[.!?…])\s+", t) if p.strip()]
+    if len(parts) < 2:
+        return [t]
+
+    merged: list[str] = []
+    for p in parts:
+        if merged and (len(p) < BURST_MIN_PART_CHARS or len(merged[-1]) < BURST_MIN_PART_CHARS):
+            merged[-1] = (merged[-1] + " " + p).strip()
+        else:
+            merged.append(p)
+
+    if len(merged) > BURST_MAX_PARTS:
+        head = merged[: BURST_MAX_PARTS - 1]
+        tail = " ".join(merged[BURST_MAX_PARTS - 1:])
+        merged = head + [tail.strip()]
+
+    return merged if len(merged) >= 2 else [t]
+
+
 def _repeat_guard_hard_fallback(input_text: str) -> str:
+    # Срабатывает когда модель залипла и повторяет одно и то же. Отвечаем
+    # коротко и в образе (сухая ирония), а не казённой фразой про "по делу".
     normalized = _normalize_reply_text(input_text)
     if not normalized:
-        return "Скажи конкретнее, что нужно."
+        return "ну чё"
     if "?" in normalized:
-        return "Уточни вопрос чуть конкретнее."
-    return "Давай по делу: что именно нужно?"
+        return "да слышала. по-другому спроси"
+    # Детерминированный выбор по длине ввода — немного варьируем реплику.
+    options = ["и чё дальше", "ну допустим", "ага, дальше что"]
+    return options[len(normalized) % len(options)]

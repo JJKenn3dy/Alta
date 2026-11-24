@@ -205,13 +205,9 @@ async def run_agent(
         if turn_metrics is not None:
             turn_metrics.editor_attempted = True
             turn_metrics.editor_trigger = ",".join(editor_triggers)
-        edited_answer = draft_answer
-        if "short_draft" in editor_triggers:
-            edited_answer = await edit_answer(
-                llm, input_text, draft_answer, temperature, top_p,
-                turn_id=turn_id, turn_metrics=turn_metrics,
-            )
-        answer = _deterministic_postprocess_answer(edited_answer or draft_answer)
+        # Короткие реплики ("ку", "норм", "ага") — это нормально для живого чата,
+        # их НЕ раздуваем отдельным LLM-вызовом. Только детерминированная чистка.
+        answer = _deterministic_postprocess_answer(draft_answer)
         if turn_metrics is not None and (answer or "").strip() != draft_answer:
             turn_metrics.editor_changed_output = True
     if not (answer or "").strip():

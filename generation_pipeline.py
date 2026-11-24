@@ -100,13 +100,16 @@ _NOW_REFERENCE_PATTERNS = (
     re.compile(r"\b(сейчас|сегодня|на данный момент|прямо сейчас)\b", re.IGNORECASE),
     re.compile(r"\b(right now|today|current(?:ly)?|at the moment|now)\b", re.IGNORECASE),
 )
+# Ужесточено: bare "год"/"день" давали ложные срабатывания (напр. "что сегодня
+# за день такой" затиралось датой). Требуем явный запрос года/числа.
 _ASK_YEAR_PATTERNS = (
-    re.compile(r"\bгод\b", re.IGNORECASE),
+    re.compile(r"\b(какой|что\s+за|в\s+каком)\s+(сейчас\s+|нынче\s+)?год", re.IGNORECASE),
+    re.compile(r"\bгод[а-я]*\s+(сейчас|сегодня|нынче)\b", re.IGNORECASE),
     re.compile(r"\b(what year|current year)\b", re.IGNORECASE),
 )
 _ASK_DATE_PATTERNS = (
     re.compile(r"\bдата\b", re.IGNORECASE),
-    re.compile(r"\b(число|день)\b", re.IGNORECASE),
+    re.compile(r"\bчисло\b", re.IGNORECASE),
     re.compile(r"\b(today'?s?\s+date|current date)\b", re.IGNORECASE),
 )
 _ASK_TIME_PATTERNS = (
@@ -500,7 +503,7 @@ def _compose_system_prompt(
             system_prompt = system_prompt + "\n\n" + profile_block
             creator_profile_tokens = approx_text_tokens(profile_block)
 
-    system_prompt += "\n\n---\nПомни: ты Альта. Отвечай коротко, живо, по-человечески. Контекст выше - справка, не шаблон."
+    system_prompt += "\n\n---\nКоротко, как живой человек в чате. Женский род о себе («сказала», «пошла», «была»). Ты НЕ ассистент: не услужливая, не объясняешь лишнего, не спрашиваешь «чем помочь» — реагируешь как своя в чате. Контекст выше - справка, не шаблон."
 
     system_tokens = approx_text_tokens(base) + sum(
         approx_text_tokens(item["content"])
@@ -695,8 +698,13 @@ async def _generate_answer_with_fallback(
                         except Exception:
                             log.warning("web regen failed, falling through", exc_info=True)
                             answer = web_fallback_answer
-                    else:
+                    elif model_search_query:
+                        # Модель сама запросила поиск — её "ответ" это просто
+                        # директива [SEARCH] без контента. Web пуст → нужен новый
+                        # проход (search_done=True, модель ответит без поиска).
                         answer = ""
+                    # else: поиск включил safety-net, а web пуст — исходный ответ
+                    # модели реальный, НЕ затираем его.
                     if not answer.strip():
                         continue
             return answer, system_prompt, filtered, system_blocks, last_mood_pending, False

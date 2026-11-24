@@ -102,6 +102,15 @@
 
 ## НИЗКИЙ ПРИОРИТЕТ
 
+- [x] **#39 История сообщений: потеря attribution в групповом чате** — `target_user_id` и `user_id` выбирались из БД но не попадали в output dict `get_last_messages`. Три последствия:
+  1. `prompt_history` не знал кому Альта отвечала → в группах ответы выглядели безатрибутными, модель путала адресатов
+  2. `_shrink_message` дропал `target_user_id` → attribution не доходила до LLM
+  3. `memory_engine._build_extraction_text` всегда падал на regex-fallback для определения user_id → при неудаче regex сообщения целевого пользователя помечались как "Другой участник чата"
+
+  Фиксы: db.py добавлен `user_id` и `target_user_id` в output dict; `_shrink_message` сохраняет `target_user_id`; `prompt_history` помечает ответы к другим пользователям как `[->id=X]`; `sanitize_outgoing_text` стрипает метку.
+
+- [x] **#40 Typing indicator гаснет через 5 секунд** — Telegram action живёт 5с, `send_chat_action("typing")` вызывался один раз перед `run_agent`. Фикс: фоновая задача `_keep_typing` обновляет индикатор каждые 4с пока агент работает, останавливается в `finally`.
+
 - [ ] **#38 Разобраться с `translator_bot_deploy/`** — папка с отдельным ботом-переводчиком лежит в репо Alta как untracked. Добавить в `.gitignore` или вынести в отдельный репо.
 
 - [ ] **#19 USER_DOCUMENT_TRIGGER_PATTERNS слишком широкие** — паттерн "мне/мой" матчит почти всё.

@@ -182,8 +182,10 @@ class TestTokenBudget:
     def test_system_prompt_size(self):
         info = estimate_system_prompt_tokens()
         assert info["chars"] > 0
-        # System prompt should be under 1000 tokens
-        assert info["tokens"] < 1000, f"System prompt too large: {info['tokens']} tokens"
+        # Персонаж намеренно обогащён: тон + повадки + few-shot примеры из реального
+        # чата. ~1400 токенов это ~18% от 8000-контекста, под историю/память остаётся
+        # ~6500 — приемлемо. 1500 — твёрдый потолок против разрастания.
+        assert info["tokens"] < 1500, f"System prompt too large: {info['tokens']} tokens"
         print(f"\n  System prompt: {info['chars']} chars = ~{info['tokens']} tokens")
 
     def test_full_plan_fits(self):

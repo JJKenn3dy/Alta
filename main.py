@@ -59,6 +59,7 @@ from aiogram.enums import ChatType
 from aiogram.types import BufferedInputFile, CallbackQuery, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageReactionUpdated
 
 from agent import ReplyContext, RouteTurn, route_mode, route_reason, run_agent
+from postprocessing import split_into_bursts
 from config import load_config
 from db import DB
 from llm import LLM
@@ -579,7 +580,7 @@ async def main():
                     chat_id=chat_id,
                     user_id=m.id,
                     permissions=ChatPermissions(
-                        can_send_messages=True,
+                        can_send_messages=False,
                         can_send_audios=False,
                         can_send_documents=False,
                         can_send_photos=False,
@@ -1164,6 +1165,28 @@ async def main():
                 else:
                     await bot.send_chat_action(chat_id, "typing")
 
+                    _typing_stop = asyncio.Event()
+
+                    async def _keep_typing():
+                        # Telegram typing-индикатор живёт ~5с, переотправляем
+                        # каждые 4с. Ждём stop-событие с таймаутом — чисто
+                        # отменяемо, без детач-sleep и busy-loop.
+                        try:
+                            while not _typing_stop.is_set():
+                                try:
+                                    await asyncio.wait_for(_typing_stop.wait(), timeout=4.0)
+                                except asyncio.TimeoutError:
+                                    pass
+                                if not _typing_stop.is_set():
+                                    try:
+                                        await bot.send_chat_action(chat_id, "typing")
+                                    except Exception:
+                                        pass
+                        except asyncio.CancelledError:
+                            pass
+
+                    _typing_task = asyncio.ensure_future(_keep_typing())
+
                     try:
                         answer = await run_agent(
                             llm=llm,
@@ -1194,6 +1217,13 @@ async def main():
                         turn_metrics.set_error(e)
                         log.error("agent failed: %s", e, exc_info=True)
                         return
+                    finally:
+                        _typing_stop.set()
+                        _typing_task.cancel()
+                        try:
+                            await _typing_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
 
                     if not answer:
                         log.warning("empty answer for chat=%s user=%s", chat_id, user_id)
@@ -1271,9 +1301,26 @@ async def main():
 
                 if sent_voice:
                     mark_voice_reply_cooldown(chat_id, user_id)
+                    await db.add_message(chat_id, bot_id, "assistant", answer, target_user_id=user_id)
                 else:
-                    await message.reply(answer)
-                await db.add_message(chat_id, bot_id, "assistant", answer, target_user_id=user_id)
+                    # Дробим ответ на 2-3 коротких сообщения как живой человек.
+                    # Первое — reply на сообщение юзера, остальные — обычной строкой
+                    # с короткой задержкой "печатает". Каждое пишем в историю отдельно.
+                    bursts = split_into_bursts(answer)
+                    for i, chunk in enumerate(bursts):
+                        if i == 0:
+                            await message.reply(chunk)
+                        else:
+                            delay = min(2.0, 0.4 + len(chunk) * 0.03)
+                            try:
+                                await bot.send_chat_action(chat_id, "typing")
+                            except Exception:
+                                pass
+                            await asyncio.sleep(delay)
+                            await bot.send_message(chat_id, chunk)
+                        await db.add_message(
+                            chat_id, bot_id, "assistant", chunk, target_user_id=user_id
+                        )
                 log.info("out chat=%s user=%s | %r", chat_id, user_id, answer[:120])
 
                 if media_catalog.get("items") and await media_cooldown_ok(
@@ -1362,37 +1409,40 @@ async def main():
         if random.random() > min(base_prob, 0.60):
             return
 
-        await db.upsert_user(user.id, user.username)
         who = f"@{user.username}" if user.username else (user.first_name or "ты")
         reaction_text = " ".join(added)
 
-        try:
-            ack = await llm.chat(
-                system_prompt=(
-                    "Ты отвечаешь на реакцию пользователя в Telegram. "
-                    "Скажи 1 короткую живую фразу по-русски, без эмодзи, без пафоса."
-                ),
-                messages=[
-                    {
-                        "role": "user",
-                        "content": f"Пользователь {who} поставил реакцию: {reaction_text}",
-                    }
-                ],
-                temperature=max(cfg.temperature, 0.8),
-                top_p=cfg.top_p,
-                max_tokens=45,
-            )
-        except Exception:
-            log.debug("reaction-ack: LLM call failed", exc_info=True)
-            return
+        # Под per-chat lock — чтобы запись истории не чередовалась с on_message
+        # того же чата (консистентный порядок реплик).
+        async with get_chat_turn_lock(chat_id):
+            await db.upsert_user(user.id, user.username)
+            try:
+                ack = await llm.chat(
+                    system_prompt=(
+                        "Ты отвечаешь на реакцию пользователя в Telegram. "
+                        "Скажи 1 короткую живую фразу по-русски, без эмодзи, без пафоса."
+                    ),
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": f"Пользователь {who} поставил реакцию: {reaction_text}",
+                        }
+                    ],
+                    temperature=max(cfg.temperature, 0.8),
+                    top_p=cfg.top_p,
+                    max_tokens=45,
+                )
+            except Exception:
+                log.debug("reaction-ack: LLM call failed", exc_info=True)
+                return
 
-        ack = sanitize_outgoing_text(convert_bracket_mentions_to_tg((ack or "").strip()))
-        if not ack:
-            return
+            ack = sanitize_outgoing_text(convert_bracket_mentions_to_tg((ack or "").strip()))
+            if not ack:
+                return
 
-        await bot.send_message(chat_id, ack, reply_to_message_id=event.message_id)
-        await db.add_message(chat_id, bot_id, "assistant", ack, target_user_id=user.id)
-        log.info("reaction: %s -> %s | ack=%r", who, reaction_text, ack)
+            await bot.send_message(chat_id, ack, reply_to_message_id=event.message_id)
+            await db.add_message(chat_id, bot_id, "assistant", ack, target_user_id=user.id)
+            log.info("reaction: %s -> %s | ack=%r", who, reaction_text, ack)
 
     log.info("polling started")
     polling_task = asyncio.create_task(dp.start_polling(bot, handle_signals=True))
@@ -1412,6 +1462,21 @@ async def main():
         for st in list(_pending_join_verification.values()):
             st.task.cancel()
         _pending_join_verification.clear()
+        # Дождаться фоновых fire-and-forget задач (extraction, mood, doc-sync),
+        # чтобы не оборвать запись в БД на полуслове перед закрытием соединения.
+        try:
+            from agent import _background_tasks
+            pending_bg = [t for t in list(_background_tasks) if not t.done()]
+            if pending_bg:
+                log.info("shutdown: draining %d background tasks", len(pending_bg))
+                await asyncio.wait_for(
+                    asyncio.gather(*pending_bg, return_exceptions=True),
+                    timeout=10,
+                )
+        except asyncio.TimeoutError:
+            log.warning("shutdown: background tasks did not finish in 10s, closing anyway")
+        except Exception:
+            log.warning("shutdown: error while draining background tasks", exc_info=True)
         await db.close()
         await bot.session.close()
         log.info("shutdown")
